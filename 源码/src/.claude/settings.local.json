@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo python3 ./extfrag_user.py -v)",
+      "Bash(sudo -n true)",
+      "Bash(python3 ./extfrag_user.py -v)",
+      "Bash(python3 -c \"import bcc\")",
+      "Bash(python3 -c \"import bpfcc\")",
+      "Bash(dpkg -l)",
+      "Bash(dpkg -L python3-bpfcc)",
+      "Bash(python3 -c \"import bcc; print\\(bcc.__file__\\)\")",
+      "Bash(python3 ./extfrag_user.py -h)",
+      "Bash(awk *)"
+    ]
+  }
+}

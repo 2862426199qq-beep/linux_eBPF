@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 编译产物（fragstress 的用户态 C 程序）
+*.o
+*.out
+源码/src/tools/fragstress/holes
+源码/src/tools/fragstress/kstack
+源码/src/tools/fragstress/sockflood
+源码/src/tools/fragstress/thpload
+
+# 实验采集的临时快照（体积大且无复现价值，需要留档的请手动改名提交）
+*.before
+*.after
+/tmp_snapshots/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
