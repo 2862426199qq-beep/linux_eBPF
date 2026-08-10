@@ -41,9 +41,11 @@ grep -E "compact_stall|compact_fail|compact_success|pgscan_direct" /proc/vmstat
 [✓] 步骤 1：compaction 埋点 format 实测核对
         → 字段全对；发现 status 实际 9 个取值，计划书只列 5 个（漏了 PARTIAL_SKIPPED）
 [✓] 给用户补讲三块基础（碎片与规整 / eBPF 与埋点 / 项目全貌）
-[ ] 步骤 2：写 tools/fragstress/ 四档压力注入器      ← ★ 你从这里开始
-[ ] 步骤 3：验收 —— compact_stall 必须顶上去（硬门槛）
-[ ] 步骤 4：写 src/bpf/compactinfo.c
+[✓] 步骤 2：写 tools/fragstress/（最短链路版：holes.c + kstack.c + hugetlb.sh
+        + run.sh + Makefile + README.md）。sockflood/dentry/thpload 待补，优先级低于 P0
+[✓] 步骤 3：验收硬门槛 **通过** —— 402 次 direct compaction，跨 3 批持续增长
+        详见 fraginfo_v2_record.md 步骤 6 与 fragstress/README.md
+[ ] 步骤 4：写 src/bpf/compactinfo.c      ← ★ 你从这里开始
 [ ] 步骤 5：extfrag.py 加分支加载
 [ ] 步骤 6：交叉验证（vmstat 对账 + PSI 比对）
 [ ] 步骤 7：出 报告_P0.md → 用户拿去给评审员，通过才进阶段二
@@ -53,7 +55,15 @@ grep -E "compact_stall|compact_fail|compact_success|pgscan_direct" /proc/vmstat
 
 ---
 
-## 二、★ 第一件事：把两个悬而未决的确认问掉
+## 二、~~★ 第一件事：把两个悬而未决的确认问掉~~ 已全部解决（2026-08-11）
+
+- **（1）阶段一步骤顺序** → 用户 2026-08-09 拍板"先打通最短链路"，已执行完毕，硬门槛通过
+- **（2）`extfrag.py` 命令行分支** → 用户 2026-08-11 拍板"加入 mode 参数（简易版）"，
+  见 `com_memory.md` 第四节决策 13
+
+下面这一节保留原文仅作历史记录，不要再拿去问用户。
+
+<details><summary>原文</summary>
 
 用户上一轮被基础概念绕住了，**这两个确认还没回复**，不确认就开工可能白干：
 
@@ -71,9 +81,15 @@ argparse 入口，直接文本打印。不新增文件、不碰 `extfrag_user.py
 > **问的时候用大白话**，别把这两个问题连同一堆术语一起抛出去。参考话术：
 > "下一步我要写一个'把机器折腾到内存变碎'的程序。写之前确认两件事：①…… ②……"
 
+</details>
+
 ---
 
-## 三、步骤 2：写 `tools/fragstress/`（P-1 压力注入器）
+## 三、步骤 2：写 `tools/fragstress/`（P-1 压力注入器）—— ✅ 已完成
+
+**当前状态**：硬门槛通过（402 次 direct compaction）。完整结果与全部踩坑记录见
+`源码/src/tools/fragstress/README.md` 与 `fraginfo_v2_record.md` 步骤 2~6。
+下面的原始设计说明保留备查。
 
 ### 3.1 这个模块要解决什么问题（讲给用户听的版本）
 

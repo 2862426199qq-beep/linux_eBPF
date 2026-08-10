@@ -15,7 +15,8 @@
 
 | 路径 | 说明 |
 |---|---|
-| `handoff/com_memory.md` | **跨会话/跨机器的共享记忆**：已确认事实、已定决策、未决问题 |
+| `handoff/com_memory.md` | **跨会话/跨机器的共享记忆**：已确认事实、已定决策、未决问题；**第九节是 TASK_P0 复盘学习任务书（可脱离实验环境学习）** |
+| `简历描述_v1v2.md` | v1+v2 合并的项目叙述 + 可直接用的简历写法 + 面试追问准备 |
 | `handoff/handoff_task.md` | **交接任务书**：下一步具体干什么 |
 | `fraginfo_v2.md` | v2 计划书（唯一施工依据） |
 | `fraginfo_v2_record.md` | 施工记录 + 内核知识点笔记（逐步追加） |
@@ -31,8 +32,8 @@
 |---|---|---|---|
 | `bpf/fraginfo.c` | kprobe `get_page_from_freelist` | 现在有多碎？ | ✅ v1 |
 | `bpf/extfraginfo.c` | tracepoint `kmem:mm_page_alloc_extfrag` | 谁在制造碎片？ | ✅ v1 |
-| `tools/fragstress/` | 用户态压力注入 | 能不能可控地造出碎片？ | 🚧 P-1 |
-| `bpf/compactinfo.c` | tracepoint `compaction:*` | 规整代价多大？成功率多少？ | ☐ P0 |
+| `tools/fragstress/` | 用户态压力注入 | 能不能可控地造出碎片？ | ✅ P-1（硬门槛已过） |
+| `bpf/compactinfo.c` | tracepoint `compaction:*` + kretprobe | 规整代价多大？成功率多少？ | 🚧 P0（已加载通过，待真实验证） |
 | `bpf/reclaiminfo.c` | tracepoint `vmscan:*` | 回收代价多大？ | ☐ P1 |
 | 归因 | 复用上述数据 | 谁造的碎片？谁付的账？ | ☐ P2 |
 
