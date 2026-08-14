@@ -326,8 +326,19 @@ int kretprobe__try_to_compact_pages(struct pt_regs *ctx) {
   if (c) lock_xadd(c, 1);
 
   if (!o) {
-    // ★ 未配对：进程在我们加载探针之前就已经进了这个函数，
-    //   或者 lru_hash 把表项淘汰掉了。如实计数，不要静默丢弃。
+    // ★ 未配对的三个来源，如实计数，不要静默丢弃：
+    //   (1) 进程在我们加载探针之前就已经进了这个函数（只在启动瞬间出现）
+    //   (2) lru_hash 把表项淘汰掉了（map 压力大时）
+    //   (3) ★ 结构性来源，2026-08-12 核对 mm/compaction.c v5.15.178 才发现：
+    //       try_to_compact_pages() 开头是
+    //           if (!gfp_compaction_allowed(gfp_mask))
+    //                   return COMPACT_SKIPPED;      ← 早退
+    //           trace_mm_compaction_try_to_compact_pages(...);  ← 埋点在后
+    //       **早退发生在入口 tracepoint 之前**，而 kretprobe 挂在函数返回上，
+    //       不管从哪条路返回都会打 → 必然产生"有出口无入口"的未配对。
+    //       这不是偶发噪声，是这条路径的固有行为。
+    //       （2026-08-12 实测 unpaired=0，因为 hugetlb 池扩容的 GFP 允许规整，
+    //         从没走这条早退；换个 caller 就会出现，届时不要误判为探针出错。）
     idx = S_OUTER_UNPAIRED;
     c = stat_map.lookup(&idx);
     if (c) lock_xadd(c, 1);

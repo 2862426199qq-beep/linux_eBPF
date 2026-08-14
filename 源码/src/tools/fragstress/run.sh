@@ -513,8 +513,15 @@ n = tot["compact_success"] + tot["compact_fail"]
 if n:
     print(f"  {'规整成功率':<20} {tot['compact_success']}/{n} = {100*tot['compact_success']/n:.1f}%")
 if tot["migrate_scanned"]:
-    print(f"  {'free/migrate 扫描比':<19} {tot['free_scanned']/tot['migrate_scanned']:.2f}  "
-          f"（远大于 1 说明空闲侧要翻很远才找得到落脚点 = 碎得厉害）")
+    # ★ 解读必须跟着数值走，理由同上面权威段（写死的结论会让工具骗人）
+    r = tot["free_scanned"] / tot["migrate_scanned"]
+    if r > 2:
+        hint = "（>2：空闲侧要翻很远才找得到落脚点）"
+    elif r < 0.5:
+        hint = "（<0.5：迁移侧要翻很远才找得到搬得动的页 —— UNMOVABLE 占比高）"
+    else:
+        hint = "（0.5~2：两侧扫描量接近，双扫描器大致对称相遇）"
+    print(f"  {'free/migrate 扫描比':<19} {r:.2f}  {hint}")
 print()
 if tot["compact_stall"] > 0:
     print("  ✓ 硬门槛通过：compact_stall 被顶起来了")

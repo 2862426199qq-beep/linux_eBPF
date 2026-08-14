@@ -422,6 +422,8 @@ Step 7 出 报告_P0.md
 | 2026-08-10 | 会话 2 | 写 `run.sh` 把时序从人脑挪进代码；踩坑并修掉：sudo+后台被 SIGTTIN 停住、stdio 全缓冲让就绪标记等不到、`holes` 天然够不着 DMA32（→ 加"库存自检"）、bash nameref 数组下标错误让循环在跨过库存线前一刻静默终止 |
 | 2026-08-11 | 会话 2 | **P-1 硬门槛通过**：402 次 direct compaction，跨 3 批持续增长，两套独立算法对账一致。发现"规整成功率悬崖"（见 3.9）与 vmstat 三条铁律（见 3.10）。给 `run.sh` 加四道自证防线。写 `fragstress/README.md`（复现步骤 + 全部踩坑记录） |
 | 2026-08-11 | 会话 2 | 写完 P0 内核态 `src/bpf/compactinfo.c` + `extfrag.py` 的 `mode` 分支与文本输出，**首次加载编译通过**（空闲机器上计数全 0，符合预期）。**尚未做"一边挂探针一边施压"的真实验证** ← 明确未完成项。用户要求补一份脱离实验环境的复盘学习任务书 → 见第九节 TASK_P0 |
+| 2026-08-13 | 会话 4 | 讲完**站⑤**（用户点名三处不懂：推论1 / 方案a 的源码佐证 / 决策3 过滤源 → 全部重讲并补进 9.6，含"探针间只能靠 map 传数据"这条地基和 T4−T1 vs T3−T2 两张直方图的分工）。**站⑥ 考了第 1~12 题**（成绩与逐题缺口见 9.7 考核记录），新记录理解偏差 3/4/5 与"答'是什么'不答'所以呢'"这个模式。用真源码逐行核对慢路径，补进 9.5：**提前规整是两种条件不只 costly**、水位线 LOW→MIN 的含义、:5121 那条"回收没进展就不许重试规整"的注释（"规整依赖回收"最硬的源码证据）。**★ 修正一条自己之前说错的话**：`compact_stall == outer_enter` **不是恒等式**，`page_alloc.c:4409` 有 `COMPACT_SKIPPED` 早退 → 精确式带减法（见 9.6 ①附、9.9）。修正上一轮口头讲错的时间线（`end` 探针并不取 order，只有 kretprobe 取）|
+| 2026-08-12 | 会话 3 | **★ P0 真实验证通过**：eBPF `outer_enter` 与 `/proc/vmstat compact_stall` **同为 377，完全相等**；三项硬检查全过。完整数据与新发现见 **9.9**。带用户走完 TASK_P0 站①②③④（站⑤⑥未完成，见 9.1 进度列）。修掉 `run.sh` 逐批段一处写死的扫描比解读（潜在谎报）。核对 `compaction.h` 真源码（本机可读），9 个 enum 值 + 4 个判定函数**从"照记录抄"升级为"源码核对过"**。开始装 `linux-hwe-5.15-source-5.15.0` 以解决存疑 A/B |
 
 ---
 
@@ -452,16 +454,90 @@ v2 的答案是"能算出碎片的**代价**"。后者才是有说服力的那�
 
 ## 9.1 学习路线图（建议按序，每一站都有明确的"过关标准"）
 
-| 站 | 主题 | 读什么 | 过关标准 |
-|---|---|---|---|
-| ① | 为什么需要 v2 | 本节 9.2 | 能说清"三个 0"是什么、为什么它让 v1 显得浅 |
-| ② | 压力是怎么造出来的 | `fragstress/README.md` + `holes.c` + `kstack.c` | 能说清为什么"随机释放"是灵魂、为什么内核栈能钉死 pageblock |
-| ③ | 实验时间线与四次失败 | 本节 9.4 | 能复述每一次失败的**根因**，不是"改了个 bug" |
-| ④ | 慢路径的内核源码逻辑 | 本节 9.5 | 能画出 `__alloc_pages_slowpath` 的顺序，说清 reclaim 与 compaction 谁先谁后 |
-| ⑤ | P0 探针的设计取舍 | `bpf/compactinfo.c` 的顶部大注释 + 本节 9.6 | 能说清"为什么要 kretprobe"和"三重来源过滤怎么做" |
-| ⑥ | 自测 | 本节 9.7 | 能不看文档回答全部问题 |
+| 站 | 主题 | 读什么 | 过关标准 | 进度 |
+|---|---|---|---|---|
+| ① | 为什么需要 v2 | 本节 9.2 | 能说清"三个 0"是什么、为什么它让 v1 显得浅 | ✅ 2026-08-11 |
+| ② | 压力是怎么造出来的 | `fragstress/README.md` + `holes.c` + `kstack.c` | 能说清为什么"随机释放"是灵魂、为什么内核栈能钉死 pageblock | ✅ 2026-08-12 |
+| ③ | 实验时间线与四次失败 | 本节 9.4 | 能复述每一次失败的**根因**，不是"改了个 bug" | ✅ 2026-08-12 |
+| ④ | 慢路径的内核源码逻辑 | 本节 9.5 | 能画出 `__alloc_pages_slowpath` 的顺序，说清 reclaim 与 compaction 谁先谁后 | ✅ 2026-08-12（有 2 处待纠正，见下） |
+| ⑤ | P0 探针的设计取舍 | `bpf/compactinfo.c` 的顶部大注释 + 本节 9.6 | 能说清"为什么要 kretprobe"和"三重来源过滤怎么做" | ✅ 2026-08-13（讲完后用户点名三处不懂，已重讲并补进 9.6）|
+| ⑥ | 自测 | 本节 9.7 | 能不看文档回答全部问题 | ◐ 1~12 已考（见 9.7 考核记录）；**13~18 未考 ← 下次从这里开始** |
 
 **时间预算**：①②③ 约 2 小时，④ 约 2 小时（最硬的一站），⑤ 约 1.5 小时，⑥ 1 小时。
+
+### ★ 站①~⑥ 学习中暴露的理解偏差（复习时重点看）
+
+用户答检查题时答错的地方，**大多是容易反过来记的**，写在这里以免重复踩。
+**下一个会话应当抽查偏差 2 和偏差 3。**
+
+**偏差 1：以为"只跑 `holes.c` 不跑 `kstack.c`，`compact_stall` 也是 0"。**
+错。`compact_stall` 的触发条件**只是"要不到高阶块"，跟页搬不搬得动无关**，
+而 `holes.c` 一个人就足够把高阶块砸光（实测 Normal order-10 从 616 → 14）。
+正确的分工是：
+
+| 计数器 | 触发条件 | 靠哪一档 |
+|---|---|---|
+| `compact_stall` | **要不到**高阶块 | 档位 1（造碎片）+ 档位 3（提需求） |
+| `compact_fail` | 挪了**也凑不出来** | **档位 2**（造不可迁移的钉子） |
+
+**偏差 2：把 free/migrate 扫描比的方向记反了**（以为压力大 → 瓶颈在 free 侧）。
+正确的记法只有一句：
+
+> **哪一侧要找的东西稀缺，那一侧就是瓶颈，它的扫描数就爆。**
+
+- 压力**轻** → 稀缺的是**连续空位**（可搬的匿名页遍地都是）→ free 侧爆 → 比值**大**
+- 压力**重** → 稀缺的是**搬得动的页**（全被内核栈/slab/已分配大页占了）→ migrate 侧爆 → 比值**小**
+
+"压力大 = 能搬的页很多"是错的：压力大恰恰意味着**能搬的页已被消耗殆尽**。
+
+**★ 2026-08-13 追记：这条用户一共答反了三次**（第三次才对）。
+根治办法是**别背结论，背推法** —— 从"内核把非空闲页往**高地址**搬"这一条出发：
+搬走的页从低处开始找（migrate 低→高），落脚点从高处开始找（free 高→低），
+**相向而行、相遇即收工**（同向就没法定义"扫完了"）。
+两个方向和比值的含义都能从这一条推出来。
+
+**偏差 3：以为"顺序释放的问题是很快被 migrate 扫描器搬走"。**
+错，而且错在时间点上：**顺序释放在 `free()` 返回之前就已经失败了，活不到规整那一步。**
+`__free_one_page()` 每释放一个页就立刻检查它的**伙伴**是否也空闲，是就当场合并升阶：
+
+```
+顺序释放 PFN 100,101,102,103 → 释放 101 时 100 已空闲，当场合并成 order-1
+                             → 103 时 102-103 合并，继而 100-103 合成 order-2
+                             → 一路向上，free list 原封不动恢复 → 什么都没破坏
+随机释放 PFN 100, 7, 253, 61 → 每个的伙伴都还被占着 → 一个都合不了 → 高阶块永久打散
+```
+
+**★ 而且"相邻"这个词不准，面试会被追**：合并要求的是**伙伴（buddy）**关系，
+由 PFN 异或决定 `buddy_pfn = pfn ^ (1 << order)`。
+反例：order-0 的 PFN **1 和 2 相邻但不是伙伴**（1 的伙伴是 0，2 的伙伴是 3），
+两个都空闲也不合并。
+推论：**随机释放的破坏力是概率性的、不是 100%** —— 释放得多总会撞上成对的。
+这也是 `holes.c` 只随机释放一部分（而不是全部）的原因：全释放等于把内存还回去。
+
+**偏差 4：把 UNMOVABLE 的作用理解成"增大压力"。**
+太糊，把两件事混成一件了。准确的分工：
+
+| 注入器 | 洞的类型 | 规整能处理吗 | 后果 |
+|---|---|---|---|
+| `holes.c` | **MOVABLE**（用户态匿名页） | 搬得走 | **卡一下但会成功** → `compact_stall` 涨，成功率仍高 |
+| `kstack.c` | **UNMOVABLE**（内核栈） | **搬不动** | **规整失败** → 成功率掉下去 |
+
+> **UNMOVABLE 页的作用不是让规整变慢，是让规整彻底失败。**
+> 一个搬不动的页钉在 pageblock 里，整个 pageblock 就永远凑不成高阶块 ——
+> 把周围全搬干净也没用。这就是 3.9 那个成功率悬崖（92%→0%）必须靠 `kstack.c` 的原因。
+
+**偏差 5：把"三个 0"记成 `compact_stall` / `compact_fail` / ?。**
+错。三个 0 是 `compact_stall` / **`pgscan_direct`** / `/proc/pressure/memory`，
+挑的是**三个互相独立的维度**（规整 / 回收 / 压力）。
+`compact_fail` 不算独立信息 —— `compact_stall` 都是 0 了它必然是 0。
+**而且最容易漏的是那条推论**：三个 0 的机器上**探针写得再对也是空表**，
+连"代码对不对"都验证不了 → **所以 v2 第一步不是写探针，是先造出真实的代价（P-1）**。
+（这正是用户 2026-08-12 那个 meta 问题"为什么不像 v1 那样直接做工具"的答案根源。）
+
+**另外，站④原文里有一处数字被实测打回**：原写"快/慢路径频率差六个数量级"，
+实测是**三个**（`pgalloc_*` 空闲机器 988 次/秒；`holes` 触碰 4GB 时 ≈24700 次/秒；
+direct compaction 峰值 ≈20 次/秒）。但真正的分界不在倍数，而在：
+**快路径永远在跑，慢路径在健康机器上从不跑**（本机开机至今为 0）。
 
 ---
 
@@ -765,30 +841,84 @@ v2 挂慢路径，整轮实验只发生 402 次 → 不需要限流，而且限�
 
 ### 慢路径里的顺序（必被追问）
 
+★ **2026-08-13 用真源码（`ksrc-5.15.178/mm/page_alloc.c`）逐行核对过，行号可信。**
+
 ```
-__alloc_pages_slowpath():
-  ① 若 order > 3（costly order）：进循环前**先来一发 direct compaction**
-  ② 进 retry 循环：
-       a. wake_all_kswapds()             唤醒后台回收线程
-       b. get_page_from_freelist()       再试一次快路径
-       c. __alloc_pages_direct_reclaim() ← **先回收**
-       d. __alloc_pages_direct_compact() ← **后规整**
-       e. 判断要不要 retry / 要不要 OOM
+__alloc_pages_slowpath()                                  page_alloc.c
+
+  ① 重算 alloc_flags —— ★ 水位线从 LOW 放宽到 MIN               :4979
+  ② wake_all_kswapds()        叫醒后台回收线程（不等它）        :4993
+  ③ get_page_from_freelist()  用放宽后的尺子再量一次            :4999
+  ④ ★★ 提前那一发规整（只对两类分配）                          :5013
+        if (can_direct_reclaim && can_compact &&
+            ( costly_order                          ← ① order > 3
+              || (order > 0 && migratetype != MOVABLE) )  ← ② 非可移动高阶
+            && !gfp_pfmemalloc_allowed(gfp_mask))
+                __alloc_pages_direct_compact(...)         :5017
+
+  retry:                                                        :5058
+  ⑤ wake_all_kswapds()        循环里再叫一次                    :5061
+  ⑥ get_page_from_freelist()  每次花钱之后都先免费试一次        :5079
+  ⑦ __alloc_pages_direct_reclaim()   ← **先回收**               :5092
+  ⑧ __alloc_pages_direct_compact()   ← **后规整**               :5097
+  ⑨ should_reclaim_retry()  → goto retry                        :5115
+  ⑩ should_compact_retry()  → goto retry                        :5126
+
+  ⑪ 出不去 → OOM killer / 返回 NULL
 ```
 
-**必须记住的两条**：
+**必须记住的四条**：
 
 1. **retry 循环里是"先 reclaim 后 compaction"**，
-   只有 costly order（order > 3）在**进循环之前**有一次提前规整。
+   进循环之前有一发提前规整，条件是**两种**（不只 costly！）：
+   `order > 3`，**或者** `order > 0 且 migratetype != MOVABLE`。
+   内核 :5008 的注释讲了理由：*"as it's likely that we have enough base pages
+   and don't need to reclaim"* + 非 MOVABLE 那类是 *"prevent permanent fragmentation"*。
+   **共同点：这两类的特征都是"回收帮不上忙"**（回收放出的是零散单页，凑不成大块）。
 2. **"direct" 的含义是"发起分配的那个进程自己同步做这件事、被阻塞在这里"** ——
    与之相对的是 kswapd（后台回收）和 kcompactd（后台规整），那两个不阻塞谁。
+3. **★ "放宽水位再试一次"不是又找了一遍内存，是换了一把更松的尺子重新量。**
+   每个 zone 有三条空闲页红线 `high > low > min`。分配的判据不是"有没有页"，
+   而是"**给完你之后剩余空闲还在红线之上吗**"，掉线下就拒绝——哪怕 free list 上还有页。
+   留这条线是给**不能失败**的分配保命：中断上下文的原子分配、以及**回收流程自己**
+   （回收也要用内存，用光就死锁）。
+   快路径用 `ALLOC_WMARK_LOW`（:5293/:5431），慢路径 `gfp_to_alloc_flags()` 一进来就
+   降到 `ALLOC_WMARK_MIN`（:4719）。**内存一页没多，只是判定标准降低了。**
+4. **慢路径的排序原则：先试免费的，不行才花钱。**
+   ③⑥ 换尺子重量（免费）→ ④⑧ 搬家（花 CPU）→ ⑦ 回收（花 CPU + 可能 IO）→ ⑪ OOM（最贵）。
+   所以每次回收或规整之后都紧跟一次 `get_page_from_freelist`。
 
 **为什么是"先回收后规整"**（这个因果链要能讲）：
 规整是"搬家"，搬家需要**目标空位**。如果空闲页太少，连搬家用的落脚点都凑不出来，
 规整无从下手 —— 所以要先回收出一些空闲页。
-这一点在 `enum compact_result` 里有直接对应：
-`COMPACT_SKIPPED(1)` 的语义就是 **"别规整了，先去回收"**
-（内核判定函数叫 `compaction_needs_reclaim()`）。
+**一句话：规整不创造内存，它只是搬家。**
+
+源码里有**两处**直接证据（面试点名一个具体枚举值，比讲一段道理有说服力）：
+
+**证据 1** —— `compaction_needs_reclaim()` 九个值里只对一个返回真：
+
+```c
+static inline bool compaction_needs_reclaim(enum compact_result result)
+{
+        return result == COMPACT_SKIPPED;      // ★ 只有这一个
+}
+```
+配套注释：*"compaction was skipped because there are not enough order-0 pages
+... **regular reclaim has to try harder and reclaim something**"*
+
+**证据 2（更硬，2026-08-13 新翻到）** —— 循环末尾第 ⑩ 步 :5121 的注释把依赖关系写死了：
+
+> *"It doesn't make any sense to retry for the compaction if the order-0 reclaim
+> is not able to make any progress **because the current implementation of the
+> compaction depends on the sufficient amount of free memory**"*
+
+```c
+if (did_some_progress > 0 && can_compact &&      // ★ 回收有进展才准重试规整
+        should_compact_retry(...))
+        goto retry;
+```
+
+> **"回收没进展 → 连规整重试的资格都没有。"** 这是"规整依赖回收"最直白的一句源码。
 
 ### 规整本身：双扫描器
 
@@ -867,14 +997,124 @@ __alloc_pages_slowpath():
     └── begin(zone B) … end(zone B)
 ```
 
-三条推论：
+各埋点带什么字段（tracefs `format` 实测）：
 
-1. **`order` 只有最外层有** → 必须两层配对（用 tid 做 key 把外层查出来）。
-   **这是"为什么不能只挂 begin/end"的答案。**
-2. **`begin` 次数 ≫ `compact_stall`** → 能和 `/proc/vmstat` 对账的是
-   **外层次数**，不是内层 begin 次数。
-3. **`migratepages` 一次 begin/end 内会打多次** → `nr_migrated/nr_failed`
-   必须**累加**，取最后一次会严重低估。
+```
+try_to_compact_pages :  order, gfp_mask, prio              ← ★ 只有这里有 order
+begin                :  zone_start, migrate_pfn, free_pfn, zone_end, sync
+end                  :  同上 5 个 + status                  ← 没有 order
+migratepages         :  nr_migrated, nr_failed             ← 没有 order
+```
+
+### ★★ 这一节的地基：eBPF 探针之间怎么传数据（用户 2026-08-13 点名要记的）
+
+> **eBPF 的探针之间不共享变量。每次触发都是独立的一次函数调用，栈是新的。
+> 探针之间传数据只有一条路：写进 map，另一个探针再读出来。**
+
+这条不只管 compaction —— **任何"测某个操作耗时"的 eBPF 工具都是这个套路**：
+入口存时刻、出口取时刻相减。业内管这张表叫 **timing map / 配对表**。
+
+### 三条推论
+
+**推论 1：`order` 只有最外层有 → 必须两层配对。**
+
+设想只挂 `begin/end`：`end` 触发时手上只有 `zone_start / migrate_pfn / free_pfn /
+sync / status`。**你能算出"这个 zone 的规整花了 5 ms"，但说不出这 5 ms 是为了凑多大的块。**
+而 order-3（32 KB）和 order-9（2 MB）的规整难度差一个量级，
+**混在一张表里算平均等于什么都没测**。
+
+**准确的说法不是"order 过期了"，是"order 不在 begin/end 自己的字段里"** ——
+它们要用就必须从别处取，而"别处"只能是我们在入口自己存下的那条 map 记录：
+
+| | 入口有探针吗 | map 里有记录吗 | order 从哪来 |
+|---|---|---|---|
+| 只挂 begin/end | ❌ | ❌ 没人存过 | **无处可取** |
+| 现在的实现 | ✅ | ✅ 入口存的 | `o->order` |
+
+**完整时间线（★ 注意：`end` 探针并不取 order，只有 kretprobe 取）**：
+
+```
+T1  外层 tracepoint    args->order = 9
+      outer_map[tid] = { ts:T1, order:9, gfp, prio }        ★ 存
+
+T2  begin              ① 查 outer_map[tid] → 只做准入判断（不取 order）
+                       ② zone_map[tid] = { ts:T2, sync }    ★ 存
+
+T3  end                ① 查 outer_map[tid] → 同样只做准入
+                       ② 查 zone_map[tid] → 取回 T2
+                          zone_lat[ sync, log2(T3−T2) ] += 1
+                       ③ zone_map.delete(tid)               ★ 用完删
+
+T4  kretprobe          ① 查 outer_map[tid] → 取回 T1 和 order   ★ order 在这才用上
+                          attempt_lat[ order, log2(T4−T1) ] += 1
+                       ② outer_map.delete(tid)              ★ 用完删
+```
+
+**两个延迟量的不是一回事，两张表都要**：
+
+| 差值 | 表 | 分维度 | 回答什么 |
+|---|---|---|---|
+| **T4 − T1** | `attempt_lat` | **order** | 这次分配一共被卡了多久 ← **主指标，"代价"** |
+| **T3 − T2** | `zone_lat` | **sync** | 单个 zone 上真正扫+搬花了多久 ← 分解 |
+
+必然 **T4−T1 ≥ Σ(T3−T2)**，差额 = 循环开销 + 被 `continue` 跳过的 zone。
+实测 `begin_accept/outer_enter = 484/377 ≈ 1.28`，即**一次外层延迟里套着 1~2 段内层延迟**。
+
+> 口径一句话：**外层测代价（用户等了多久），内层测机制（花在哪个 zone、同步还是异步）。**
+
+**推论 2：`begin` 和 `compact_stall` 粒度不同 → 只能和外层对账。**（详见 9.6 ①附）
+
+**推论 3：`migratepages` 一次 begin/end 内会打多次** → `nr_migrated/nr_failed`
+必须**累加**，取最后一次会严重低估。
+
+### ①附　★ `compact_stall` 精确对账等式（2026-08-13 核对源码后修正）
+
+**先修正一条之前写得不够准的话。** 9.9 里写了 "`outer_enter` 与 `compact_stall`
+同为 377，完全相等"——**数据是真的，但"恒等"的说法不成立。**
+`count_vm_event(COMPACTSTALL)` 不在 `try_to_compact_pages` 里，而在**它的调用者**里，
+而且**前面有一个早退**：
+
+```c
+__alloc_pages_direct_compact()                          page_alloc.c:4384
+    psi_memstall_enter()                                :4394   ← 压力计时开始
+    *compact_result = try_to_compact_pages(...)         :4397   ← 真正干活的
+    psi_memstall_leave()                                :4402
+    if (*compact_result == COMPACT_SKIPPED) return NULL; :4409  ← ★★ 早退，不计数！
+    count_vm_event(COMPACTSTALL);                       :4410   ← compact_stall++
+    page = get_page_from_freelist(...)                  :4418   ← 搬完再试一次
+    if (page) { count_vm_event(COMPACTSUCCESS); ... }   :4425
+    count_vm_event(COMPACTFAIL);                        :4433
+```
+
+**所以精确的等式是：**
+
+```
+compact_stall  ==  outer_exit  −  (返回值 == COMPACT_SKIPPED 的次数)
+```
+
+2026-08-12 那批数据 `attempt_status` 是 `SUCCESS 376 / CONTENDED 1`，
+**`SKIPPED` 一次都没有** → 减数为 0 → 退化成 377 == 377。
+**但内存真紧张时 `SKIPPED` 会大量出现，那时 `compact_stall` 会明显小于 `outer_enter`。**
+→ **`报告_P0.md` 里这条必须写成带减法的等式，并注明当日减数为 0。**
+
+**为什么不能和 `begin` 对账 —— 因为两个方向都会偏，误差无法用系数校正：**
+
+| 剧情 | outer | begin | compact_stall |
+|---|---|---|---|
+| 正常，遍历 2 个 zone | 1 | **2** | 1 |
+| 正常，1 个 zone 就拿到 | 1 | **1** | 1 |
+| 所有 zone 都 `compaction_deferred` → `continue` | 1 | **0** | 1（DEFERRED≠SKIPPED，照涨）|
+| 返回 `COMPACT_SKIPPED` | 1 | 0 | **0** |
+
+> **`compact_stall` 的粒度是"一次尝试"，`begin` 的粒度是"一个 zone"。
+> 粒度不同的两个计数器天生不可对账。** 要对账只能找同粒度的那一层 = 外层探针。
+
+**⚠️ 别把 deferred 和 contended 混**（用户 2026-08-13 混过一次）：
+`compaction_deferred` 是**进 `compact_zone` 之前**就被劝退（begin 不打）；
+`COMPACT_CONTENDED` 是**已经进去了**才遇到锁竞争（begin 早打过了）。
+
+→ 由此得出**外层探针的第三个用途**：它是**唯一能和 `/proc/vmstat` 对账的一层**。
+没有它，eBPF 的数据就是一组无法与内核官方计数交叉验证的孤立数字。
 
 ### ② 为什么还要一个 kretprobe（★ 最值得讲的设计决策）
 
@@ -900,9 +1140,45 @@ __alloc_pages_slowpath():
 | 手动 `compact_memory` | 管理员触发，也没有进程在等分配 | 不要 |
 
 不过滤，"平均规整延迟"会被后台线程严重稀释。
+**实测这不是理论担忧**：`migratepages` 收到 3138 条，其中 **2075 条是噪声**，
+有效只有 1063 条 —— **噪声比数据多一倍**。
 
-**判据：只有 direct compaction 会经过 `try_to_compact_pages`**（②③ 直接调
-`compact_zone`）→ 内层探针的准入条件是"**当前 tid 有没有活跃的外层记录**"。
+**麻烦在于三者打出来的事件长得一模一样**：真正干活的是 `compact_zone()`
+（扫描、挪页都在里面），三个内层埋点就在它里面。三条路最后都跑进同一个
+`compact_zone()`，**没有任何字段能区分来源**。
+
+**判据：终点相同，但"怎么走进来"不同 —— 只有 direct compaction 经过
+`try_to_compact_pages`。** 2026-08-12 查过 `compact_zone()` 的**全部**调用点，共四个：
+
+| 行号 | 调用者 | 来源 | 经过 `try_to_compact_pages` |
+|---|---|---|---|
+| 2544 | `compact_zone_order()` ← 2605 `try_to_compact_pages` | ① direct | **✅ 只有这一条** |
+| 2673 | `proactive_compact_node()` | ② kcompactd 主动规整 | ❌ |
+| 2703 | `compact_node()` ← 2761 `sysctl_compaction_handler` | ③ 管理员 `echo 1` | ❌ |
+| 2859 | `kcompactd_do_work()` | ② kcompactd 主循环 | ❌ |
+
+→ 内层探针的准入条件就是"**当前 tid 有没有活跃的外层记录**"。
+
+> **记忆画面（登记台）**：停车场门口有个登记台 = `try_to_compact_pages`。
+> 只有**找不到车位的司机**（进程自己）会去登记台叫人挪车；
+> **保安**（kcompactd）和**经理**（管理员）走员工通道，不登记。
+> 站在挪车现场看见有人在挪车，怎么知道是哪一种？**去登记台查有没有这个人的记录。**
+
+**所以外层探针有三个用途**（很容易只记住第一个）：
+1. 拿 `order`（推论 1）
+2. **当准入凭证** —— 它在 map 里的存在**本身**就是"这次是 direct compaction"的证明
+3. 唯一能和 `/proc/vmstat` 对账的一层（①附）
+
+**★ 由此顺带答出一道高频题**：`echo 1 > /proc/sys/vm/compact_memory`
+**为什么不能用来验证 direct compaction？**
+不是因为"它是异步的"（它其实是同步的），而是因为**它绕开了 `try_to_compact_pages`**，
+后果有两个、两头都错：
+- **`compact_stall` 不涨**（那个计数器在慢路径里加）→ **它根本不能当验收手段**
+- **begin/end 照常打**（最后也跑进同一个 `compact_zone`）→ **只挂内层的工具会误收**
+
+> 一边"没有信号"，一边"有假信号"。**这是最坏的一种验证手段。**
+> 句式记住：问"为什么不能用 X 验证"，答案永远是"**X 会让指标在不该动时动、
+> 在该动时不动**"，光说"X 是别的东西"不够。
 
 **必须在内核态做**（决策 #7）：捞到用户态再扔，等于白付一次 map 写入
 加一次 perf 传输的开销。
@@ -917,6 +1193,24 @@ v1 的 `extfraginfo.c` 用 `>>32` 取 tgid 做按进程聚合，那是对的。
 
 但 compaction / reclaim 是**线程**行为：同一个进程的两个线程同时进慢路径，
 用 tgid 做 key 会**互相覆盖**，配对全乱。所以 v2 用**完整的 u64**（即 tid）。
+
+**★ 答这题不能只说"tid 唯一"，要说清用错了会怎样**（这是"什么"和"为什么"的区别）：
+
+```
+线程 A(tid=100)、B(tid=101) 同属进程 99，同时陷入慢路径：
+用 tgid=99 做 key：
+   A 进入 → map[99] = { ts:T1, order:9 }
+   B 进入 → map[99] = { ts:T5, order:3 }   ★ 把 A 的记录覆盖了
+   A 退出 → 查 map[99] 拿到 B 的数据 → 延迟算成 T4−T5、order 记成 3   ← 全错
+   B 退出 → map[99] 已被 A 删掉 → 记一笔"未配对"
+```
+
+**后果不是崩溃，是安静地算出一堆错数字。**
+（`compactinfo.c` 里 `zone_t` 上方那句注释"同一个线程在同一时刻只会在一个 zone 上
+做规整，begin/end 严格嵌套，不会交错"——**这个"不交错"的前提只有用 tid 才成立**。）
+
+> 通用规则：**配对表的 key 必须唯一标识"一条执行流"。内核里执行流的单位是线程 →
+> 永远用 tid。** 多线程程序上用 tgid 是 eBPF 新手最经典的 bug 之一。
 
 ### ⑤ 四道自证机制（P0 的可信度全靠这个）
 
@@ -981,6 +1275,305 @@ v1 的 `extfraginfo.c` 用 `>>32` 取 tgid 做按进程聚合，那是对的。
 | 6, 7, 8, 9, 11 | 9.5 |
 | 10, 12, 13, 14, 15 | 9.6 |
 | 16, 17, 18 | 9.4 |
+
+### ★ 考核记录（2026-08-13，闭卷，第 1~12 题）
+
+**第一遍成绩：基础 6 题 2.5 分，进阶 6 题 1.5 分。重答后大部分补齐。**
+下一个会话不必从头重考，**按下表只抽查"要补"那几条**。
+
+| 题 | 第一遍 | 重答 | 缺口 / 要补什么 |
+|---|---|---|---|
+| 1 三个 0 | 半对 | — | `compact_fail` 记错→是 `pgscan_direct`；漏"空表→先造代价"推论（偏差 5）|
+| 2 随机释放 | **机制错** | ✅ | 错在归因给规整；正解是 `__free_one_page()` 当场合并（偏差 3）|
+| 3 kstack | 半对 | — | UNMOVABLE 是让规整**失败**不是变慢（偏差 4）|
+| 4 内核栈 order-2 | 空 | ◐ | `CONFIG_VMAP_STACK=y`；**"虚拟内存 order-2"这个说法要改**（order 是 buddy 的词，vmalloc 区不用它描述）；"可能不连续"→**几乎必然不连续**；**只给了配置证据，漏了行为证据**（KernelStack 涨而 order-2 未减）|
+| 5 compact_memory | **全错**（答"异步"）| ◐ | 它其实是同步的；真原因是绕开 `try_to_compact_pages`。**重答只说了"它是什么"，没说"所以验证不了什么"**（见 9.6 ③末）|
+| 6 快/慢路径 + 限流 | 半对 | — | 限流由挂点频率决定：24700/s vs 20/s |
+| 7 谁先 | ✅ | — | 提前规整是**两种**条件，不只 costly |
+| 8 为什么先回收 | 机制对 | ◐ | **漏了题目点名的枚举值 `COMPACT_SKIPPED`** |
+| 9 双扫描器 | **反了（第 3 次）** | ✅ | 已用"往高地址搬"推法钉住（偏差 2）|
+| 10 对账 | 层对/理由错 | ◐ | 把 deferred 说成"zone 被其它进程占据"（那是 CONTENDED）；正解是**粒度 1:N、两方向都偏**（9.6 ①附）|
+| 11 成功率口径 | 列 3 漏 1 | ◐ | 补内层宽松 89.5%；要答"我报 99.7%，因为粒度对齐到一次尝试" |
+| 12 tid/tgid | 定义对 | ◐ | **只答了"是什么"，没答"用错会怎样"**（安静算错，不是崩溃）|
+
+**★ 用户自己提出的一个好直觉，值得记**：看到"成功率有四种口径"时说"感觉怪怪的"。
+这个不适感是对的 —— 它来自"成功率应该只有一个数"的默认假设。**这题的真考点就是打掉它**：
+
+> **"成功"没有唯一定义，必须先说清"谁的成功、在什么粒度上"。**
+> 四种口径 = **2×2**：粒度（一个 zone / 一次尝试）× 判据（规整自己成功 / 分配最终拿到页）。
+> 而 **"报一个数字却不知道它是哪种口径"正是 v1 那类工具的通病：看起来精确，实际上没有定义。**
+
+**一个反复出现的答题模式（下次要专门纠）**：用户倾向于答"**它是什么**"，
+而题目问的是"**它导致什么后果**"（第 5、12 题都栽在这儿）。
+→ **面试里"是什么"只是前半句，不接"所以呢"等于没答。**
+
+---
+
+## 9.9 ★ P0 真实验证（2026-08-12，本项目最有说服力的一组数据）
+
+> 这是 `compactinfo.c` 写出来之后**第一次抓到真实事件**。
+> 在此之前它只做到"能编译、能加载"，map 全空 —— 而空 map 和坏探针长得一样。
+> 产物：`/tmp/compactinfo.log`、`/tmp/fragstress_run.log`、
+> `/tmp/fragstress-20260812-115647/`（**注意 `/tmp` 重启会清，要留证据必须拷出来**）。
+
+### 执行方式（顺序不能颠倒）
+
+```bash
+sudo -v                                  # 先在前台过密码，否则后台作业被 SIGTTIN 挂住
+grep -E "^(compact_|pgscan_direct|pgsteal_direct|allocstall)" /proc/vmstat > /tmp/vmstat.t0
+cd 源码/src
+sudo nohup python3 extfrag.py --mode compact --interval 30 --duration 1500 > /tmp/compactinfo.log 2>&1 &
+sleep 20                                 # BCC 要现场编译+挂载，等它真加载完
+cd tools/fragstress && sudo nohup ./run.sh > /tmp/fragstress_run.log 2>&1 &
+```
+
+**★ 探针必须先挂**：eBPF 探针是被内核事件触发的，**探针没挂上的那段时间里发生的规整，事后一个都补不回来**。
+
+### 三项硬检查（全过）
+
+| 检查 | 实测 | 意义 |
+|---|---|---|
+| eBPF `outer_enter` vs `/proc/vmstat` `compact_stall` 增量 | **377 vs 377，一个不差**（★ 但**不是恒等**，见下） | 两个互不相干的计数器给出同一数字 → 工具没在瞎编 |
+| `begin_reject > 0` | **171** | 三重来源过滤真在工作，不是摆设 |
+| 直方图样本数 == `outer_exit − unpaired` | 377 == 377 − 0 | 没丢样本；LRU_HASH 没因容量不足丢记录 |
+| `begin_accept ≫ outer_enter` | 484 > 377 | 内层是 per-zone 粒度（一次外层遍历多个 zone） |
+
+**未配对率 0.00%**（377 进 / 377 出）。
+
+> ★ **2026-08-13 修正：那条 377=377 不是恒等式。**
+> `count_vm_event(COMPACTSTALL)` 在 `page_alloc.c:4410`，**前面 :4409 有个早退**
+> `if (*compact_result == COMPACT_SKIPPED) return NULL;` ——
+> **返回 SKIPPED 时 `compact_stall` 不涨。**
+> 精确等式：`compact_stall == outer_exit − (返回 COMPACT_SKIPPED 的次数)`。
+> 当日 `SKIPPED = 0` 所以减数为 0，等式退化成相等。**数据没错，我原来给的理由不完整。**
+> 详细推导与"为什么不能和 begin 对账"见 **9.6 ①附**。
+> **写报告时用带减法的那个式子。**
+
+### eBPF 侧完整输出
+
+```
+外层进入 / 退出            377 / 377
+内层 begin 接纳 / 被过滤   484 / 171
+内层 end   接纳            484
+migratepages 接纳 / 被过滤 1063 / 2075      ← 被挡掉的比收下的多一倍
+外层结局：SUCCESS 376 (99.7%)  CONTENDED 1 (0.3%)
+内层结局：SUCCESS 373  PARTIAL_SKIPPED 55  COMPLETE 51  CONTENDED 5   （合计 484 ✓）
+累计迁移页：成功 166973 / 失败 8071  → 迁移失败率 4.6%
+```
+
+**`migratepages` 有 2/3 是噪声。** 不做来源过滤，"平均迁移多少页"会被 kcompactd
+的后台活动污染成三倍。而 `compact_daemon_wake = 86` 从旁证实那些被挡掉的事件真实存在
+（不是过滤器乱挡）—— **两份日志互相印证**。
+
+### 真正的交付数据：代价有多大（`/proc/vmstat` 永远给不出）
+
+```
+每次 direct compaction 的总延迟（order = 9，即 2MB）
+        512 ~ 1023   μs |  50
+       1024 ~ 2047   μs | 141  ← 众数
+       2048 ~ 4095   μs | 132
+       4096 ~ 8191   μs |  31
+       8192 ~ 16383  μs |   8
+      16384 ~ 32767  μs |   5
+      32768 ~ 65535  μs |   1  ← 最坏一次 65 毫秒
+```
+
+**一句话版本（可直接用于简历/面试）**：
+**碎片让每次 2MB 分配同步阻塞 1~2 ms（众数），P99 约 16 ms，最坏 65 ms。**
+
+这就是 v1 答不出、v2 能答的那个"所以呢"：
+v1 只能说"碎片指数 0.87"；v2 能说"因此有 377 次分配被卡住，中位数 1~2ms，尾部 65ms"。
+
+### `/proc` 侧（run.sh，与 eBPF 完全独立，不含一行 eBPF）
+
+```
+compact_stall 377 = compact_success 377 + compact_fail 0   （恒等式 ✓）
+compact_daemon_wake 86
+compact_isolated 1140569
+free/migrate 扫描比 = 6209849/1615448 = 3.84   （>2：空位难找）
+pgscan_direct 0   pgsteal_direct 0   allocstall_movable 0
+PSI some/full = 694 ms / 689 ms
+逐批：批1-4 stall=0（白拿区）→ 批5 stall=95 → 批6 134 → 批7 148
+库存自检：可白拿 826 → 第一批跳到 743 → 目标保持 2000，提前收工于 1943
+```
+
+**库存自检成功"预测"了现象出现的时机**：预测批 1-4 是白拿区（stall=0），
+实测正是如此；越过库存线的批 5 立刻出现 95 次规整。
+**一个能预测自己什么时候会看到现象的实验，比"碰巧看到了"强得多。**
+
+### ★★ 新发现 1：`377 stall / 0 pgscan_direct` 是 costly order 提前规整的实测证据
+
+乍看矛盾：慢路径是"先回收后规整"，怎么可能规整 377 次而直接回收 0 次？
+
+解释：hugetlb 要 **order-9 > 3 = costly order**，走的是
+`__alloc_pages_slowpath()` **retry 循环之前**那一发提前规整（9.5 第②节的第①步）。
+规整成功率 99.7%，拿到页就直接返回了，**retry 循环压根没进去**，
+所以 `__alloc_pages_direct_reclaim()` 一次都没被调用。
+
+> **这组数字只能由"规整发生在回收之前"来解释。**
+> 它把内核对 costly order 的特殊处理**实测出来了**，不是从注释里读出来的。
+
+对照：order-2（非 costly）**不可能**出现这个组合，它会先付回收的代价。
+
+### ★★ 新发现 2：同一批数据能算出四个"成功率"，全都对
+
+| 口径 | 算法 | 结果 | 回答的问题 |
+|---|---|---|---|
+| `compaction_made_progress`（严格） | 373/484 | **77.1%** | 内层每个 zone 真挪成了吗 |
+| 不算"真失败"（宽松） | (484−51)/484 | **89.5%** | 排除"整个 zone 白扫"之外都算没输 |
+| 外层返回值（**本工具报的**） | 376/377 | **99.7%** | 规整这次**行动**成功了吗 |
+| `/proc/vmstat` 口径 | 377/377 | **100.0%** | **分配最终拿到页了吗** |
+
+那 **1 次差异**的真实剧情：规整返回 `COMPACT_CONTENDED`（锁竞争放弃），
+但分配器回头一试，页从别处拿到了 → **规整失败，分配成功**。
+所以 vmstat 记成功、eBPF 记失败。**两者都没错，问的不是一个问题。**
+
+**面试价值**：被问"你这个成功率怎么算的"，能答出四种口径 + 实测到的那 1 次差异
++ 差异的机制 —— 这比报一个数字强得多。
+
+### ★ `PARTIAL_SKIPPED` 出现 55 次 = 计划书那个漏项的实测代价
+
+计划书只列了 5 个 `status` 值，漏了 `PARTIAL_SKIPPED(6)`。本轮内层实测它出现 **55 次 / 484**。
+**照计划书写会无声无息地丢掉 11% 的样本。**
+→ 这是"埋点上线前必须实测 `format`、不能照文档抄"的直接证据。
+
+### 本轮源码核对（本机 `include/linux/compaction.h` 可读，路径见 3.x）
+
+`/lib/modules/5.15.0-139-generic/build/include/linux/compaction.h` **本机存在**
+（BCC 编译就靠它）。已核对：`enum compact_result` **确为 9 个值**，
+四个判定函数（`compaction_made_progress` 只认 `SUCCESS`、`compaction_failed` 只认
+`COMPLETE`、`compaction_withdrawn` 收 `DEFERRED/CONTENDED/PARTIAL_SKIPPED`、
+`compaction_needs_reclaim` 只认 `SKIPPED`）全部与 9.5 所述一致。
+
+两条内核注释原文（**照抄，不是解读**）：
+
+```c
+	/* compaction didn't start as it was not possible or direct reclaim
+	 * was more suitable */
+	COMPACT_SKIPPED,
+```
+```c
+static inline bool compaction_needs_reclaim(enum compact_result result)
+{
+	/* Compaction backed off due to watermark checks for order-0
+	 * so the regular reclaim has to try harder and reclaim something. */
+	if (result == COMPACT_SKIPPED)
+```
+
+→ **`SKIPPED` 不是"规整失败"，是"规整判断自己不该上、该让回收更卖力"**，
+内核自己写的。同时这也是"若某轮全是 `SKIPPED`，则 `pgscan_direct` 必然**大**、
+`compact_*_scanned` 必然**小**"的依据（易错点：`pgscan_direct` 是**回收**的扫描，
+不是规整的扫描）。
+
+### 本轮必须如实记下的三条
+
+1. **没复现"成功率悬崖"。** 本轮成功率 100%、`compact_fail = 0`，因为脚本攒够
+   377 次证据就**提前收工**了，停在 1943 个大页，没进入上轮那个失败区间。
+   **3.9 那组悬崖数据至今只有一次观测，没有第二次独立复现。**
+   要复现须调大 `STALL_GOAL` 或把目标顶到内存上限。
+2. **`batches.csv` 异常没复现，但不等于已解决。** 本轮 7 行全部单调、
+   增量合理、`95+134+148=377` 对得上。上轮那个"物理上不可能的负增量"**机制仍未查清**。
+   "没再出现" ≠ "已修好"。
+3. **12000 线程的 UNMOVABLE 污染仍不足以让规整失败**（`compact_fail = 0`）。
+   说明规整失败**不是"有污染就会发生"，而是"污染密度 × 需求压力"共同越过门槛才发生**。
+
+### 存疑状态（截至 2026-08-12）
+
+| 编号 | 内容 | 状态 |
+|---|---|---|
+| — | `enum compact_result` 9 值 + 4 判定函数 | ✅ 本机头文件核对（`compaction.h` 在头文件包里） |
+| 存疑 A | 慢路径 costly order 提前规整的条件 | ✅ **2026-08-12 源码核实，原判断正确**（见下） |
+| 存疑 B | 双扫描器调用顺序；`isolate_freepages()` 是否只由 `compaction_alloc()` 触发 | ✅ **2026-08-12 源码核实，原判断正确**（见下） |
+
+### 源码在哪（★ 取源码的正确姿势，别再走 apt 那条弯路）
+
+```
+/home/xxy/wlsp/ksrc-5.15.178/mm/{page_alloc.c, compaction.c, vmscan.c, internal.h}
+```
+（**在 Git 仓库之外**，不要提交进仓库）
+
+**为什么是 5.15.178**：`cat /proc/version_signature` →
+`Ubuntu 5.15.0-139.149~20.04.1-generic 5.15.178`，末尾就是**上游基线版本**。
+`mm/` 核心逻辑基本是纯上游代码，Ubuntu 很少改动。
+
+取法（**不需要 sudo**，单文件几十~两百 KB，秒级）：
+
+```bash
+D=/home/xxy/wlsp/ksrc-5.15.178/mm; mkdir -p $D
+B='https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain'
+for f in page_alloc.c compaction.c vmscan.c internal.h; do
+  curl -sS -m 90 -o "$D/$f" "$B/mm/$f?h=v5.15.178"
+done
+```
+
+**★ 走 apt 的两条弯路，别重复踩**：
+
+1. 包名不是 `linux-source-5.15.0`。本机是 Ubuntu 20.04（focal，原生内核系列 5.4），
+   5.15 来自 **HWE 通道**（`linux-generic-hwe-20.04` 已装）。
+   判断标准只看 `uname -r`，不看发行版版本。
+2. **但正确包名 `linux-hwe-5.15-source-5.15.0` 装上也没用 —— 它是个空壳。**
+   实测 `dpkg -L` 只有 `changelog.Debian.gz` 和 `copyright` 两个文件，
+   `/usr/src` 下**一个 tarball 都没有**（下载量 74 kB 就已经说明问题，
+   真源码是 100 MB+ 量级）。而且仓库里最新只有 `-126.136`，
+   与运行的 `-139.149` 差 13 个 ABI 版本，`deb-src` 也未启用。
+   → **教训：让别人装包之前先 `apt-cache show` 看 Size，装完先 `dpkg -L` 看清单。**
+
+### 存疑 A 的答案（`page_alloc.c` 实测行号）
+
+```c
+	/*
+	 * For costly allocations, try direct compaction first, as it's likely
+	 * that we have enough base pages and don't need to reclaim. For non-
+	 * movable high-order allocations, do that as well, as compaction will
+	 * try prevent permanent fragmentation by migrating from blocks of the
+	 * same migratetype.
+	 */
+	if (can_direct_reclaim && can_compact &&
+			(costly_order ||
+			   (order > 0 && ac->migratetype != MIGRATE_MOVABLE))
+			&& !gfp_pfmemalloc_allowed(gfp_mask)) {
+		page = __alloc_pages_direct_compact(...);
+```
+
+→ **提前规整不只给 costly order，还给"非 MOVABLE 的任意高阶分配"。**
+所以 **order-2 的内核栈（`GFP_KERNEL` → UNMOVABLE）也走提前规整；
+order-2 的用户匿名页（MOVABLE）不走，会先付回收的代价。**
+（注：本版还多一个 `can_compact = gfp_compaction_allowed(gfp_mask)` 前置条件。）
+
+### 慢路径顺序的精确行号（站④第 2 条的源码依据）
+
+| 行 | 内容 |
+|---|---|
+| 4993 | `wake_all_kswapds()` ← 循环**之前** |
+| **5016** | `__alloc_pages_direct_compact()` ← **★ costly / 非 MOVABLE 高阶的那一发提前规整** |
+| 5058 | `retry:` ← 循环开始 |
+| 5061 | `wake_all_kswapds()` |
+| **5092** | `__alloc_pages_direct_reclaim()` ← 注释 `/* Try direct reclaim and then allocating */` |
+| **5098** | `__alloc_pages_direct_compact()` ← 注释 `/* Try direct compaction and then allocating */` |
+| 5115 / 5126 | `should_reclaim_retry()` / `should_compact_retry()` |
+
+→ **提前规整在循环外（5016）；循环内回收（5092）严格早于规整（5098）。**
+这就是 9.9 那个 `377 stall / 0 pgscan_direct` 的源码级解释。
+
+### 存疑 B 的答案（`compaction.c` 实测）
+
+```c
+static struct page *compaction_alloc(struct page *migratepage, unsigned long data)
+{
+	if (list_empty(&cc->freepages)) {
+		isolate_freepages(cc);        /* ← 第 1688 行，全文件唯一调用点 */
+```
+
+`isolate_freepages()` 在整个 `compaction.c` 里**只被调用一次**，
+就在 `compaction_alloc()`（`migrate_pages()` 的 get_new_page 回调）里，
+而且**只在"手上的落脚点用完了"时才调**。
+
+而 `compact_zone()` 主循环第一句是 `switch (isolate_migratepages(cc))`，
+遇到 `ISOLATE_NONE`（一个能搬的页都没找到）直接 `goto check_drain` ——
+**整个迁移步骤被跳过，空闲侧扫描器一步都不走。**
+
+→ **"空闲侧是被迁移侧叫来的"得到源码证实。** 两个扫描器的工作量在结构上就不对称，
+这正是扫描比方向的成因：迁移侧找不到东西时，分母涨、分子不涨 → 比值变小。
 
 ---
 
