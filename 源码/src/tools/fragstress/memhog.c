@@ -214,24 +214,65 @@ static void *worker(void *arg)
 }
 
 /*
- * 维持期：不再新增内存，而是反复重写已有的页，
- * 让这批页保持"热"，压力不会因为 kswapd 慢慢回收而消退。
- * 给 eBPF 探针留一个稳定的观测窗口。
+ * 维持期：**边还边要**，把总占用维持在水位线附近不动，
+ * 但持续制造新的分配请求。
+ *
+ * ★ 2026-08-15 实测教训（第一版写错了，必须记住）：
+ *
+ * 第一版的维持期是"反复重写已有的页"（只 touch 不新增）。
+ * 实测那 20 秒里 pgscan_direct 从 3691 **一格没动** ——
+ * 重写的是**已经在内存里的页，根本不产生分配**，自然不会触发回收。
+ *
+ * 结果就是：eBPF 探针挂上去，观测窗口里一个事件都收不到。
+ *
+ * > **要观测分配路径，就必须持续制造"分配"这个动作本身，
+ * >   而不是制造"内存占用"这个状态。**
+ *
+ * 所以改成：munmap 掉一块，立刻 mmap+memset 一块新的。
+ * 总占用不变（不会越压越深、不会 OOM），但每一轮都是**全新的缺页**，
+ * 而且是在"free 已经贴着水位线"的前提下发生的 —— 每次都很可能踩进直接回收。
  */
-static void *churner(void *arg)
+static volatile unsigned long recycle_cursor = 0;
+static volatile unsigned long recycle_count  = 0;
+
+static void *recycler(void *arg)
 {
 	(void)arg;
 	while (!stop_flag) {
 		pthread_mutex_lock(&chunk_lock);
-		int n = n_chunks;
+		if (n_chunks == 0) {
+			pthread_mutex_unlock(&chunk_lock);
+			break;
+		}
+		int i = (int)(recycle_cursor++ % (unsigned long)n_chunks);
+		void  *old = chunks[i];
+		size_t sz  = chunk_sz[i];
+		chunks[i]  = NULL;          /* 占位，防止别的线程同时挑中它 */
 		pthread_mutex_unlock(&chunk_lock);
 
-		for (int i = 0; i < n && !stop_flag; i++) {
-			/* 每页写一个字节即可，比 memset 全块便宜得多 */
-			char *base = (char *)chunks[i];
-			for (size_t off = 0; off < chunk_sz[i]; off += 4096)
-				base[off] = (char)(off >> 12);
+		if (!old) {                 /* 撞上了别的线程正在换的块，跳过 */
+			usleep(1000);
+			continue;
 		}
+
+		munmap(old, sz);            /* 先还 —— 总占用短暂下降一个块 */
+
+		void *fresh = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+		if (fresh == MAP_FAILED) {
+			pthread_mutex_lock(&chunk_lock);
+			chunk_sz[i] = 0;
+			pthread_mutex_unlock(&chunk_lock);
+			stop_flag = 1;
+			stop_reason = "维持期 mmap 失败";
+			break;
+		}
+		memset(fresh, 0x5A, sz);    /* 再要 —— 全新缺页，这才是我们要的分配动作 */
+
+		pthread_mutex_lock(&chunk_lock);
+		chunks[i] = fresh;
+		recycle_count++;
+		pthread_mutex_unlock(&chunk_lock);
 	}
 	return NULL;
 }
@@ -283,6 +324,8 @@ int main(int argc, char **argv)
 	long base_scan_kswapd   = vmstat("pgscan_kswapd");
 	long base_stall_normal  = vmstat("allocstall_normal");
 	long base_stall_dma32   = vmstat("allocstall_dma32");
+	long base_stall_dma     = vmstat("allocstall_dma");
+	long base_stall_movable = vmstat("allocstall_movable");
 	long base_compact_stall = vmstat("compact_stall");
 	long base_pswpout       = vmstat("pswpout");
 
@@ -349,30 +392,41 @@ int main(int argc, char **argv)
 
 	/* ---- 维持期：只重写不新增 ---- */
 	if (opt_hold_s > 0) {
-		printf("\n--- 进入维持期 %d 秒（只重写已有页，不再新增）---\n", opt_hold_s);
+		printf("\n--- 进入维持期 %d 秒（边还边要：总占用不变，持续制造新分配）---\n",
+		       opt_hold_s);
 		fflush(stdout);
 		stop_flag = 0;
 		pthread_t ch[8];
 		int nch = opt_threads > 8 ? 8 : opt_threads;
 		for (int i = 0; i < nch; i++)
-			pthread_create(&ch[i], NULL, churner, NULL);
+			pthread_create(&ch[i], NULL, recycler, NULL);
 
 		double h0 = now_s();
+		long hold_base_scan = vmstat("pgscan_direct");
 		while (now_s() - h0 < opt_hold_s && !stop_flag) {
-			usleep(500 * 1000);
-			long d_scan = vmstat("pgscan_direct") - base_scan_direct;
+			usleep(1000 * 1000);
+			long d_hold  = vmstat("pgscan_direct") - hold_base_scan;
 			long avail_mb = meminfo_kb("MemAvailable") / 1024;
-			printf("  维持 %5.1fs  MemAvail=%ld MB  scan_direct 增量=%ld\n",
-			       now_s() - h0, avail_mb, d_scan);
+			printf("  维持 %5.1fs  MemAvail=%ld MB  换块 %lu 次  "
+			       "维持期内 scan_direct 增量=%ld\n",
+			       now_s() - h0, avail_mb, recycle_count, d_hold);
 			fflush(stdout);
-			if (avail_mb >= 0 && avail_mb < opt_floor_mb / 2) {
-				printf("  维持期触到下限的一半，提前结束\n");
+			/*
+			 * ★ 2026-08-15 实测收紧：原来这里写的是 floor/2，
+			 * 结果一轮跑下来 MemAvailable 一路掉到 84 MB —— 太深了。
+			 * 原因是主压期停手后 kswapd 还有一大批换页积压没做完，
+			 * MemAvailable 会**继续下滑一段**，刹车必须提前踩。
+			 */
+			if (avail_mb >= 0 && avail_mb < opt_floor_mb * 3 / 4) {
+				printf("  维持期触到下限的 3/4，提前结束\n");
 				break;
 			}
 		}
 		stop_flag = 1;
 		for (int i = 0; i < nch; i++)
 			pthread_join(ch[i], NULL);
+		printf("--- 维持期结束：共换块 %lu 次，期内 pgscan_direct 增量 %ld ---\n",
+		       recycle_count, vmstat("pgscan_direct") - hold_base_scan);
 	}
 
 	for (int i = 0; i < opt_threads; i++)
@@ -385,12 +439,16 @@ int main(int argc, char **argv)
 	long end_scan_kswapd   = vmstat("pgscan_kswapd");
 	long end_stall_normal  = vmstat("allocstall_normal");
 	long end_stall_dma32   = vmstat("allocstall_dma32");
+	long end_stall_dma     = vmstat("allocstall_dma");
+	long end_stall_movable = vmstat("allocstall_movable");
 	long end_compact_stall = vmstat("compact_stall");
 	long end_pswpout       = vmstat("pswpout");
 	long min_avail_mb      = meminfo_kb("MemAvailable") / 1024;
 
 	long allocated = 0;
 	for (int i = 0; i < n_chunks; i++) {
+		if (!chunks[i])          /* 维持期正好换到一半的槽位 */
+			continue;
 		allocated += chunk_sz[i];
 		munmap(chunks[i], chunk_sz[i]);
 	}
@@ -405,6 +463,9 @@ int main(int argc, char **argv)
 	printf("%-22s %12ld\n", "pgscan_kswapd",     end_scan_kswapd   - base_scan_kswapd);
 	printf("%-22s %12ld\n", "allocstall_normal", end_stall_normal  - base_stall_normal);
 	printf("%-22s %12ld\n", "allocstall_dma32",  end_stall_dma32   - base_stall_dma32);
+	printf("%-22s %12ld\n", "allocstall_dma",    end_stall_dma     - base_stall_dma);
+	printf("%-22s %12ld  ★\n", "allocstall_movable",
+	       end_stall_movable - base_stall_movable);
 	printf("%-22s %12ld\n", "compact_stall",     end_compact_stall - base_compact_stall);
 	printf("%-22s %12ld\n", "pswpout（换出页）",  end_pswpout       - base_pswpout);
 
@@ -419,10 +480,27 @@ int main(int argc, char **argv)
 		printf("  下一步试：加大 --threads（分配更猛）、减小 --chunk、或抬高 --gb。\n");
 	}
 
-	/* 自证：allocstall 是"进了几次慢路径回收"，pgscan_direct 是"扫了几页"。
-	 * 两者要么同时为 0，要么同时非 0；一个 0 一个非 0 说明读数有问题。 */
-	long d_stall = (end_stall_normal - base_stall_normal) +
-		       (end_stall_dma32  - base_stall_dma32);
+	/*
+	 * 自证：allocstall 是"进了几次慢路径回收"，pgscan_direct 是"扫了几页"。
+	 * 两者要么同时为 0，要么同时非 0；一个 0 一个非 0 说明读数有问题。
+	 *
+	 * ★ 2026-08-15 修正：原来只加了 normal + dma32，结果第一次实测就报了假警报。
+	 *
+	 * 根因在 mm/vmscan.c:3334：
+	 *     __count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+	 * 计数是按 **sc->reclaim_idx = gfp_zone(gfp_mask)** 分桶的，
+	 * 而普通用户态匿名页用的是 GFP_HIGHUSER_MOVABLE → gfp_zone() 返回
+	 * **ZONE_MOVABLE**，所以计的是 allocstall_movable。
+	 * 哪怕本机 Movable zone 是空的（free=0），桶还是按 gfp 的**意图**分的，
+	 * 不是按最后实际从哪个 zone 拿到页分的。
+	 *
+	 * 教训：**按 zone 分桶的计数器必须四个桶全加**，
+	 * 少加一个就会把"正常"读成"异常"。
+	 */
+	long d_stall = (end_stall_normal  - base_stall_normal) +
+		       (end_stall_dma32   - base_stall_dma32)  +
+		       (end_stall_dma     - base_stall_dma)    +
+		       (end_stall_movable - base_stall_movable);
 	if ((d_scan > 0) != (d_stall > 0))
 		printf("\n⚠ 自检不一致：pgscan_direct 增量 %ld，但 allocstall 增量 %ld —— "
 		       "两者应当同为 0 或同为非 0，数据存疑。\n", d_scan, d_stall);

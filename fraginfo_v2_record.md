@@ -1272,12 +1272,131 @@ Node 0, zone    DMA32  free=764090  min=4148   low=5185   high=6222
 `./memhog --gb 12 --threads 8 --goal 1 --floor 200`，靠吃穿页缓存 + 换页拖慢 kswapd。
 更"自然"，但慢（≈60 s 起）、窗口窄、OOM 风险实打实。**方案 B 不行再上。**
 
-### 7.7 待办（本步骤未完成部分）
+### 7.7 ★ 硬门槛实测：方案 A 直接就过了（2026-08-15）
 
-- [ ] 用户跑 7.4 的实测命令 → 拿到 `format` 文件的真实字段与 offset
-- [ ] 用户跑方案 B → **硬门槛：`pgscan_direct` 增量 > 0**
-- [ ] 门槛过了才动手写 `源码/src/bpf/reclaiminfo.c`
-- [ ] 门槛过不了 → 停下来一起调，**不准硬着头皮写 P1**（P-1 的规矩照旧）
+**方案 B（抬水位）没用上** —— 它需要 `sudo sysctl`，而 AI 这边跑不了特权命令；
+方案 A（硬压）**完全不需要 root**，先跑了，结果一次通过。
+
+证据全部存在 `~/p1_evidence/`（★ 不在 `/tmp`，P0 就是在这里丢过一次原始日志）。
+
+基线（干净得可以当教科书）：
+
+```
+pgscan_direct 0   pgsteal_direct 0   pgscan_kswapd 0
+allocstall_dma 0  allocstall_dma32 0  allocstall_normal 0  allocstall_movable 0
+compact_stall 0   pswpout 0
+/proc/pressure/memory   some total=0   full total=0
+```
+
+#### 三轮实验
+
+| 轮 | 命令要点 | 吃下 | 耗时 | `pgscan_direct` | `allocstall` 合计 | `pswpout` |
+|---|---|---|---|---|---|---|
+| 1 | `--gb 11 --threads 8 --goal 1 --floor 250` | 4.62 GB | 31.1 s | **3624** | 7 | 0 |
+| 2 | 同上 + `--hold 20`（重写式维持） | 6.44 GB | 36.9 s | 3691 | 6 | 149 |
+| 3 | `--goal 999999999 --floor 400 --hold 40`（换块式维持） | 9.12 GB | 48.1 s | **49596** | **491** | 85713 |
+
+**第 1 轮就过了硬门槛**，而且是在 `MemAvailable` 还有 4.3 GB 的时候触发的 ——
+比预想的早得多。说明**直接回收看的是 zone 级水位，不是"总内存还剩多少"**。
+
+三轮累计 PSI：
+
+```
+some total = 8391452 µs = 8.39 s
+full total = 6499962 µs = 6.50 s
+```
+
+504 次 allocstall → **平均每次 stall 约 16.6 ms**。
+这就是 P1 的第三方对账基准（和 P0 用 PSI 校验规整延迟是同一手法）。
+
+#### ★ 教训 1：工具自己报了一次假警报（第 1 轮）
+
+第 1 轮结束时 memhog 打出：
+
+```
+⚠ 自检不一致：pgscan_direct 增量 3624，但 allocstall 增量 0 ——
+  两者应当同为 0 或同为非 0，数据存疑。
+```
+
+**是自检写错了，不是数据有问题。** 查 `/proc/vmstat` 发现
+**`allocstall_movable = 7`**，而我的自检只加了 `normal + dma32`。
+
+根因在 `mm/vmscan.c:3334`：
+
+```c
+	if (!cgroup_reclaim(sc))
+		__count_zid_vm_events(ALLOCSTALL, sc->reclaim_idx, 1);
+```
+
+计数按 **`sc->reclaim_idx = gfp_zone(gfp_mask)`** 分桶，
+而普通用户态匿名页用 `GFP_HIGHUSER_MOVABLE` → `gfp_zone()` 返回 **`ZONE_MOVABLE`**。
+**哪怕本机 Movable zone 是空的（`free=0`），桶还是按 gfp 的"意图"分，
+不是按最后实际从哪个 zone 拿到页分。**
+
+> **通用教训：按 zone 分桶的计数器必须四个桶全加，少一个就会把正常读成异常。**
+> 这次是"假警报"（虚惊），但同样的错误反过来就是"假通过"——
+> P-1 那次谎报事故就是后者。
+
+已修（`memhog.c` 自检段的注释里留了完整推导）。
+
+#### ★ 教训 2：维持期第一版设计是错的 —— 观测窗口会是空的
+
+第一版维持期的做法是"反复重写已有的页"。第 2 轮实测：
+
+```
+维持 14.1s  MemAvail=3202 MB  scan_direct 增量=3691
+维持 20.1s  MemAvail=2670 MB  scan_direct 增量=3691    ← 20 秒一格没动
+```
+
+**重写的是已经在内存里的页，根本不产生分配，自然不触发回收。**
+探针挂上去，整个观测窗口一个事件都收不到。
+
+> **要观测分配路径，必须持续制造"分配"这个动作本身，
+> 而不是制造"内存占用"这个状态。**
+
+改成**边还边要**：munmap 一块，立刻 mmap+memset 一块新的。
+总占用不变（不会越压越深），但每一轮都是全新的缺页，
+而且发生在"free 已经贴着水位线"的前提下。
+
+第 3 轮验证：维持期内 `pgscan_direct` 涨了 **30862**（占全轮的 62%），
+`allocstall` 从个位数涨到 **491 次** —— 够做分阶延迟直方图了。
+
+#### ★ 教训 3：刹车踩晚了
+
+第 3 轮压到 `MemAvailable` 只剩 **84 MB**，比设定的 `--floor 400` 深得多。
+原因是主压期停手后 **kswapd 还有一大批换页积压没做完，MemAvailable 会继续下滑**。
+维持期的刹车线已从 `floor/2` 收紧到 `floor*3/4`。
+
+没有触发 OOM，三道保险都没用上 —— 但这是运气好，不是设计好。
+
+#### 由此确定的 P1 对账等式（写探针之前必须先定死）
+
+```
+kretprobe(try_to_free_pages) 次数 = begin 次数 + throttle 早退次数     (vmscan.c:3570)
+Σ allocstall_*(四个桶)           = begin 次数 + do_try_to_free_pages 内部 retry 次数
+```
+
+第二条的修正项来自 `do_try_to_free_pages` 里的 `retry:` 标签（:3330），
+**ALLOCSTALL 的计数点 :3334 在 retry 标签之后** —— 同一次调用可能计多次。
+两个 `goto retry` 都在"这一轮什么都没回收到"的兜底路径上（:3396 / :3405）。
+
+> 和 P0 的 `compact_stall == outer_exit − SKIPPED` 是同一个形状：
+> **对账等式基本都不是恒等式，一定要先找出修正项。**
+> 本轮实测 `pgscan_direct_throttle = 0`，所以第一条这次会退化成相等 ——
+> **但那是巧合，不能写成恒等式**（P0 已经在这上面栽过一次）。
+
+### 7.8 待办
+
+- [x] **硬门槛：`pgscan_direct` 增量 > 0** —— 通过（491 次事件，方案 A）
+- [ ] **需要 root，AI 跑不了**：实测两个 tracepoint 的 `format` 文件
+      （字段名、类型、offset 有没有 padding）
+- [x] `try_to_free_pages` 是全局符号 —— `/proc/kallsyms` 里是 `T`，kretprobe 挂得上
+      （`do_try_to_free_pages` 是 `t`，挂不了，正好也不需要）
+- [ ] 写 `源码/src/bpf/reclaiminfo.c`
+- [ ] `extfrag.py` 加 `--mode reclaim` 分支（不新开 py 文件）
+- [ ] 正式观测轮：**先挂探针 → 再跑 memhog → 结束后拷证据出来**（顺序不可颠倒）
+      建议参数 `--gb 11 --threads 8 --goal 999999999 --floor 800 --hold 60`
+      （floor 抬到 800，别再压到 84 MB）
 
 ---
 
