@@ -13,7 +13,7 @@ CC      := gcc
 CFLAGS  := -O2 -Wall -Wextra -g
 LDLIBS_PTHREAD := -lpthread
 
-TARGETS := holes kstack
+TARGETS := holes kstack memhog
 
 .PHONY: all clean check
 
@@ -31,6 +31,10 @@ holes: holes.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 kstack: kstack.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
+
+# P1 用：把内存压到 kswapd 追不上，逼出 direct reclaim
+memhog: memhog.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS_PTHREAD)
 
 clean:

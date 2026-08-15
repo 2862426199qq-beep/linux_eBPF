@@ -1037,14 +1037,255 @@ setvbuf(stdout, NULL, _IOLBF, 0);   /* 强制行缓冲 */
 
 ---
 
-## 下一步
+---
 
-- [ ] 待用户拍板:`extfrag.py` 怎么加命令行入口(`mode` 参数 + `__main__` argparse)
-- [ ] 写 `源码/src/bpf/compactinfo.c`(P0)
-- [ ] 补齐 fragstress 档位 2/3/4 的剩余文件(优先级低于 P0)
-- [ ] 装内核源码核实两条存疑项
-- [ ] 过了硬门槛 → 补齐 `sockflood.c` / `dentry.sh` / `thpload.c` / `run.sh` / `README.md`
-- [ ] 过不了 → 停下来一起调压力策略,**不准硬着头皮写 P0**
-- [ ] 装内核源码,核实两条存疑项:
-      `sudo apt install linux-source-5.15.0` 或 `apt-get source linux-image-unsigned-$(uname -r)`
-- [ ] 步骤 5 再问:`extfrag.py` 怎么加命令行入口
+## ★ 阶段 P0 的记录去哪了（2026-08-15 补索引）
+
+**P0 阶段（`compactinfo.c` + 真实验证）当时没有写进本文件**，散在别处。
+为免下次找不到，这里留索引：
+
+| 内容 | 在哪 |
+|---|---|
+| P0 正式交付报告（7 节，给评审员） | `报告_P0.md` |
+| P0 真实验证的完整原始数据 | `handoff/com_memory.md` **§9.9** |
+| P0 探针的设计取舍（为什么要 kretprobe、三重过滤） | `handoff/com_memory.md` **§9.6** |
+| 慢路径内核源码逻辑（带 v5.15.178 行号） | `handoff/com_memory.md` **§9.5** |
+| 18 道自测题的全文答案 | `handoff/com_memory.md` **§9.8** |
+
+**从 P1 开始，实验过程重新记回本文件**（步骤 7 起），
+`com_memory.md` 只放"跨会话必须知道的结论"，两边分工不再混。
+
+---
+
+## 步骤 7:P1 开工 —— 前置硬门槛（2026-08-15）
+
+### 7.1 为什么 P1 不能直接写探针
+
+P0 那轮的数据里有一个刺眼的组合：
+
+```
+compact_stall  = 377     ← 直接规整发生了 377 次
+pgscan_direct  = 0       ← 直接回收一次都没发生
+pgsteal_direct = 0
+```
+
+**现有压力形态（hugetlb 抢 order-9）根本触发不了直接回收。**
+
+根因在慢路径的结构（`mm/page_alloc.c`,v5.15.178）：
+
+```
+:5013   if (can_direct_reclaim &&
+            (costly_order || (order > 0 && migratetype != MOVABLE)))
+:5017       __alloc_pages_direct_compact(...)     ← 进 retry 循环"之前"的提前规整
+            ...拿到页就 goto got_pg
+
+:5058   retry:                                     ← 真正的 retry 循环
+:5092       __alloc_pages_direct_reclaim(...)      ← 直接回收在这里,从没被调用
+```
+
+order-9 是 costly order，走 `:5013` 那一发提前规整就拿到页返回了，
+**根本没进 retry 循环**。
+
+> **所以 P1 的第 0 步不是写代码，是换压力形态。**
+> 性质完全等同于 P-1 之于 P0：**空 map 和坏探针长得一模一样**，
+> 不先造出事件，连"探针写对没有"都无法验证。
+
+### 7.2 源码勘察结果（写代码前先把结构定死）
+
+#### ① 埋点位置：比 P0 干净得多
+
+`mm/vmscan.c:3540 try_to_free_pages()`：
+
+```c
+	if (throttle_direct_reclaim(sc.gfp_mask, zonelist, nodemask))
+		return 1;                                        // :3570 ★ 提前返回
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	trace_mm_vmscan_direct_reclaim_begin(order, sc.gfp_mask);   // :3573
+
+	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);          // :3575
+
+	trace_mm_vmscan_direct_reclaim_end(nr_reclaimed);            // :3577
+```
+
+**和 P0 的 compaction 比，结构上有三处关键差异**：
+
+| | P0 (compaction) | P1 (reclaim) |
+|---|---|---|
+| 内层埋点是否被多来源共用 | **是**（direct / kcompactd / 管理员三条路共用 `compact_zone`）→ 必须做三重过滤 | **否**。`mm_vmscan_direct_reclaim_begin/end` 只有 direct reclaim 会打；kswapd 和 memcg 各有自己的 tracepoint | 
+| begin 里有没有 order | **没有**（只有 zone/nid/idx）→ 必须靠外层探针传 | **有**（`TP_PROTO(int order, gfp_t gfp_flags)`）|
+| 结局怎么拿 | 出口没有 tracepoint → 必须加 kretprobe 取返回值 | **end 直接给 `nr_reclaimed`** |
+| begin/end 配对关系 | 1:N（外层一次，内层遍历多个 zone） | **1:1**（同一个函数体内，中间只夹一个调用） |
+
+> **结论：计划书里写的"P1 骨架复用 P0"只对了一半。**
+> 三重来源过滤和"外层传 order"这两块**不需要**了 ——
+> reclaim 的 tracepoint 位置比 compaction 好得多。
+
+**但有一处必须复用 P0 的教训**：`:3570` 那个 `throttle_direct_reclaim` 的提前返回，
+**结构上和 `page_alloc.c:4409` 的 `COMPACT_SKIPPED` 早退一模一样** ——
+走这条路的话 begin/end 一个都不打，事件整个消失。
+所以仍然值得在 `try_to_free_pages` 上挂一个 kretprobe，
+用 **kretprobe 次数 − end 次数 = 被 throttle 掉的次数** 当自证机制。
+
+#### ② tracepoint 字段（从 `/usr/src/.../include/trace/events/vmscan.h` 读的）
+
+```c
+DECLARE_EVENT_CLASS(mm_vmscan_direct_reclaim_begin_template,
+	TP_PROTO(int order, gfp_t gfp_flags),
+	TP_STRUCT__entry(
+		__field(	int,	order		)
+		__field(	gfp_t,	gfp_flags	)
+	), ...);
+
+DECLARE_EVENT_CLASS(mm_vmscan_direct_reclaim_end_template,
+	TP_PROTO(unsigned long nr_reclaimed),
+	TP_STRUCT__entry(
+		__field(	unsigned long,	nr_reclaimed	)
+	), ...);
+```
+
+**★ 按 P0 的教训，这个不算数 —— 必须以本机 tracefs 的 `format` 文件为准**
+（P0 就是因为信了计划书才漏掉 `status` 的 4 个取值，还踩了 offset padding）。
+待跑的命令见 7.4 第 ① 步。
+
+#### ③ 延迟窗口能和 PSI 对账
+
+`__perform_reclaim()`（`page_alloc.c:4643`）：
+
+```c
+	psi_memstall_enter(&pflags);
+	fs_reclaim_acquire(gfp_mask);
+	noreclaim_flag = memalloc_noreclaim_save();
+	progress = try_to_free_pages(...);          // ← 我们量的就是这一段
+	memalloc_noreclaim_restore(noreclaim_flag);
+	fs_reclaim_release(gfp_mask);
+	psi_memstall_leave(&pflags);
+```
+
+**PSI 的计时窗口正好套在 `try_to_free_pages` 外面一层。**
+所以 eBPF 测出来的"总回收延迟"应当≈`/proc/pressure/memory` 的 total 增量 ——
+这是 P1 现成的第三方交叉验证线（P0 用过同样的手法）。
+
+另外 `__perform_reclaim` 是 `static`、且被 `static inline` 的
+`__alloc_pages_direct_reclaim` 包着，**挂不了 kprobe**；
+`try_to_free_pages` 是全局符号，可以挂。
+
+### 7.3 ★ 一个差点掉进去的坑：不能用 cgroup 限内存来造压力
+
+直觉上"把内存 hog 关进一个 memcg、`memory.max` 限住"更安全。**但这条路是错的。**
+
+`mm/vmscan.c:2212`：
+
+```c
+	item = current_is_kswapd() ? PGSCAN_KSWAPD : PGSCAN_DIRECT;
+	if (!cgroup_reclaim(sc))
+		__count_vm_events(item, nr_scanned);        // ← cgroup 触发的回收不计这里
+	__count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
+```
+
+**cgroup 内触发的回收不增加全局 `pgscan_direct` / `pgsteal_direct`。**
+
+后果：eBPF 侧能抓到事件，`/proc/vmstat` 侧却是 0 ——
+**交叉验证这条线整条失效**，而它正是本项目全部可信度的来源。
+
+> 记下来的通用教训：**造压力的手段会改变验证手段是否成立。**
+> 选压力形态之前，先确认它不会把对账基准打掉。
+
+所以必须用**全局压力**，代价是有 OOM 风险，用三道保险顶（见 7.4）。
+
+### 7.4 写了 `memhog.c`（fragstress 档位 5）
+
+`源码/src/tools/fragstress/memhog.c`，~370 行，`make memhog` 编译通过（`-Wall -Wextra` 零告警）。
+
+手法：**多线程 mmap 匿名内存 + memset 写脏**，把分配速率顶到 kswapd 追不上。
+
+内核侧的预期链条：
+
+```
+free 跌破 low  → 唤醒 kswapd（后台回收，计 pgscan_kswapd）
+free 跌破 min  → 申请者自己被拉去回收
+                 __alloc_pages_direct_reclaim() :5092
+                 → __perform_reclaim()          :4643
+                 → try_to_free_pages()          vmscan.c:3540
+                 → 计 pgscan_direct / pgsteal_direct
+```
+
+三道安全保险：
+
+| # | 保险 | 作用 |
+|---|---|---|
+| 1 | 启动即把自己 `oom_score_adj` 设成 1000 | 真 OOM 时**第一个被杀的是 memhog**，不是桌面/ssh（提高自己的分数不需要 root）|
+| 2 | `--goal`：`pgscan_direct` 一达标立刻停手并释放 | 正常情况下远在内存耗尽前退出 |
+| 3 | `--floor`：`MemAvailable` 低于阈值（默认 400 MB）无条件停手 | goal 没达到也不再往下压 |
+
+另有一条自证：`pgscan_direct` 和 `allocstall_*` **必须同为 0 或同为非 0**，
+不一致就打警告（P-1 谎报事故的同类防线）。
+
+### 7.5 ★ 实测：这台机器的分配速率上不去（关键约束）
+
+先做了两次小规模冒烟测试（各 1~2.5 GB，跑完立即释放，不构成压力）：
+
+| 线程数 | 吃下 | 耗时 | 速率 | `pgscan_direct` |
+|---|---|---|---|---|
+| 2 | 1.12 GB | 17.0 s | **66 MB/s** | 0 |
+| 8 | 2.50 GB | 16.7 s | **150 MB/s** | 0 |
+
+4 线程翻到 8 线程只快了 2.3 倍 —— **4 个 vCPU 已经打满，150 MB/s 就是天花板。**
+
+单独测了带宽，定位到瓶颈在**缺页异常**而不是内存带宽：
+
+```
+首次触碰 512MB: 6.474 s -> 79 MB/s      ← 每次缺页约 50 µs
+二次重写 512MB: 0.294 s -> 1739 MB/s    ← 差 22 倍
+```
+
+50 µs/缺页比正常慢一个数量级。环境事实：`systemd-detect-virt = vmware`，
+THP 是 `[madvise]`（所以拿的全是 4KB 页，512 MB 要 131072 次缺页）。
+**合理怀疑是 VMware 宿主侧的按需供页/气球，但没有证据，不写成结论。**
+
+**这个约束直接决定了策略**：150 MB/s 大概率**跑不赢** kswapd 回收干净页缓存的速度
+（那不需要 I/O，轻松上 GB/s）。硬压只有在页缓存耗尽、kswapd 被迫换页到磁盘之后
+才有机会赢 —— 那时离 OOM 也不远了，窗口很窄。
+
+### 7.6 由此定的两套方案
+
+**方案 B（推荐，主选）：人为抬高 min 水位**
+
+不去比谁快，而是**把终点线往前挪**。`vm.min_free_kbytes` 现在是 67584 kB（66 MB）：
+
+```
+Node 0, zone   Normal  free=474837  min=12725  low=15906  high=19087
+Node 0, zone    DMA32  free=764090  min=4148   low=5185   high=6222
+```
+
+把 `min_free_kbytes` 抬到 2 GB，min 水位就跟着涨约 30 倍，
+**free 立刻贴到 min 附近** —— 此时只要再吃几百 MB，每一次分配都会跌破 min，
+直接回收当场就来。
+
+- 优点：**不需要真的把内存耗尽 → 基本没有 OOM 风险**；快、可复现、可精确调节
+- 优点：走的是**完全相同的内核代码路径**（`:5092`），观测到的事件是真的
+- 代价：属于人为制造的低内存假象，**报告里必须写清楚**，不能假装是自然负载
+- 反转：一条 sysctl 就能恢复
+
+**方案 A（备选）：硬压到换页**
+
+`./memhog --gb 12 --threads 8 --goal 1 --floor 200`，靠吃穿页缓存 + 换页拖慢 kswapd。
+更"自然"，但慢（≈60 s 起）、窗口窄、OOM 风险实打实。**方案 B 不行再上。**
+
+### 7.7 待办（本步骤未完成部分）
+
+- [ ] 用户跑 7.4 的实测命令 → 拿到 `format` 文件的真实字段与 offset
+- [ ] 用户跑方案 B → **硬门槛：`pgscan_direct` 增量 > 0**
+- [ ] 门槛过了才动手写 `源码/src/bpf/reclaiminfo.c`
+- [ ] 门槛过不了 → 停下来一起调，**不准硬着头皮写 P1**（P-1 的规矩照旧）
+
+---
+
+## 下一步（P-1 时期遗留，部分已完成）
+
+- [x] 待用户拍板:`extfrag.py` 怎么加命令行入口(`mode` 参数 + `__main__` argparse)
+- [x] 写 `源码/src/bpf/compactinfo.c`(P0)
+- [x] 装内核源码核实两条存疑项（`ksrc-5.15.178`,**不进仓库**）
+- [ ] 补齐 fragstress 档位 2/3/4 的剩余文件（`sockflood.c` / `dentry.sh` / `thpload.c`,优先级低于 P1）
+- [ ] `extfrag.py` 补 15 行：从 `/proc/vmstat` 读 `compact_migrate_scanned` /
+      `compact_free_scanned` 算扫描比（现在这段逻辑只在 `run.sh` 里,简历第 2/3 点靠它兑现）
