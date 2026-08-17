@@ -1569,10 +1569,34 @@ ksrc-5.15.178/
 | 项 | 状态 |
 |---|---|
 | C 代码 clang 编译 | ✅ 零错误（用手工补的 `args` 结构体绕开 tracefs 权限，见 ① ） |
-| BPF verifier 接受 | ❌ **未验证，要 root** |
+| BPF verifier 接受 | ✅ **2026-08-18 通过**（见下） |
 | `print_reclaim` 全分支能跑 | ✅ 用假 BPF 后端跑通，两个显示 bug 就是这么抓到的 |
 | `print_compact` 改动未回归 | ✅ 同上 |
 | 运行时数字正确 | ❌ **未验证**，等正式观测轮 |
+
+#### ⑦ verifier 关（2026-08-18，`--duration 5` 空载）
+
+```
+sudo python3 extfrag.py --mode reclaim --duration 5
+```
+
+四个探针（kprobe + kretprobe + 2 tracepoint）全部挂载成功，程序加载运行无错。
+唯一输出是 BCC 那三个 `__HAVE_BUILTIN_BSWAP*__ macro redefined` 警告 ——
+BCC 自己的命令行 `-D` 和内核头文件重复定义，P0 也有，无害。
+
+**这一轮多确认了一件手工桩验不了的事**：这次 BCC 是**读目标机上真实的
+`format` 文件**生成 `args` 结构体的（有 root 了）。编译通过 →
+`args->order` / `args->gfp_flags` / `args->nr_reclaimed` 三个字段名
+在这个内核上确实存在且拼写正确。之前用手工补的结构体只能验语法，
+验不了"字段名和真实内核一致"。
+
+事件数全 0 —— 5 秒空载、没有内存压力，这是**预期结果**，不是探针没工作。
+（能区分"没事件"和"探针坏了"的依据：如果探针没挂上，BCC 会在 attach 阶段
+就抛异常，不会正常打印汇总。）
+
+verifier 通过意味着：所有 map 访问、指针解引用、`bpf_probe_read` 边界
+都被内核检查过了。**但运行时的数值正确性一点都没验** ——
+零事件的情况下，那些字段读取路径根本没被执行到具体数据。
 
 ### 7.10 待办
 
@@ -1583,9 +1607,7 @@ ksrc-5.15.178/
 - [x] 写 `源码/src/bpf/reclaiminfo.c`
 - [x] `extfrag.py` 加 `--mode reclaim` 分支（不新开 py 文件）
 - [x] `extfrag.py` 补双扫描器扫描比 + `compact_stall` 自动对账（简历第 2/3 点靠它兑现）
-- [ ] **需要 root**：让 verifier 过一遍
-      `sudo python3 源码/src/extfrag.py --mode reclaim --duration 5`
-      —— 这一步只验"挂得上、不崩"，不看数字
+- [x] **需要 root**：让 verifier 过一遍 —— 2026-08-18 通过，见 7.9 ⑦
 - [ ] 正式观测轮：**先挂探针 → 再跑 memhog → 结束后拷证据出来**（顺序不可颠倒）
       建议参数 `--gb 11 --threads 8 --goal 999999999 --floor 800 --hold 60`
       （floor 抬到 800，别再压到 84 MB）
