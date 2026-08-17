@@ -9,6 +9,7 @@ __pycache__/
 *.out
 源码/src/tools/fragstress/holes
 源码/src/tools/fragstress/kstack
+源码/src/tools/fragstress/memhog
 源码/src/tools/fragstress/sockflood
 源码/src/tools/fragstress/thpload
 

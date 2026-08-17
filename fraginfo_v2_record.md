@@ -1124,8 +1124,59 @@ order-9 是 costly order，走 `:5013` 那一发提前规整就拿到页返回�
 **但有一处必须复用 P0 的教训**：`:3570` 那个 `throttle_direct_reclaim` 的提前返回，
 **结构上和 `page_alloc.c:4409` 的 `COMPACT_SKIPPED` 早退一模一样** ——
 走这条路的话 begin/end 一个都不打，事件整个消失。
-所以仍然值得在 `try_to_free_pages` 上挂一个 kretprobe，
-用 **kretprobe 次数 − end 次数 = 被 throttle 掉的次数** 当自证机制。
+所以仍然值得在 `try_to_free_pages` 上挂一个 kretprobe。
+
+> ### ⚠️ 2026-08-17 更正：上面这段的**结论部分是错的**
+>
+> 当时紧接着写的是"用 **kretprobe 次数 − end 次数 = 被 throttle 掉的次数**
+> 当自证机制"。**这句话不成立**，写代码时读完 `throttle_direct_reclaim()`
+> 的函数体才发现。
+>
+> 错因：只读了调用点 `if (throttle_direct_reclaim(...)) return 1;`，
+> 就以为"被限流 → 返回 true → 早退"。但真正决定返回值的逻辑在**被调函数的末尾**：
+>
+> ```c
+> count_vm_event(PGSCAN_DIRECT_THROTTLE);              // :3515 ★ 睡之前就计数
+>
+> if (!(gfp_mask & __GFP_FS))
+>         wait_event_interruptible_timeout(pgdat->pfmemalloc_wait,
+>                 allow_direct_reclaim(pgdat), HZ);    // :3527 最多睡 1 秒
+> else
+>         wait_event_killable(zone->zone_pgdat->pfmemalloc_wait,
+>                 allow_direct_reclaim(pgdat));        // :3530 ★ 睡到 kswapd 叫醒，无上限
+>
+> if (fatal_signal_pending(current))
+>         return true;                                 // :3533-3534 ★ 只有这里返回 true
+> out:
+>         return false;
+> ```
+>
+> 也就是说：**正常被限流的进程是睡一觉、醒来返回 false、继续往下走到 begin 埋点。**
+> `return true` 只发生在睡眠期间收到致命信号（进程正在被杀）时。所以：
+>
+> ```
+> ✗ 错：kretprobe 次数 = begin 次数 + 被限流次数
+> ✓ 对：kretprobe 次数 = begin 次数 + 被限流且期间收到致命信号的次数（通常 0）
+> ✓ 对：被限流次数 = /proc/vmstat 的 pgscan_direct_throttle（:3515 在睡之前就计了）
+> ```
+>
+> **但外层 kretprobe 不该撤掉，反而更重要了** —— 只是它量的东西变了：
+> 限流的睡眠发生在 begin **之前**，所以
+>
+> ```
+> begin → end        = 纯扫描耗时（不含限流睡眠）
+> 函数入口 → 返回     = 进程实际被卡住的总时长（含限流睡眠）★ 用户感知到的就是这个
+> 两者之差           = 排队/限流睡掉的时间
+> ```
+>
+> 而且 PSI 窗口（`page_alloc.c:4653/4662`）包的是**整个 `try_to_free_pages` 调用**，
+> 所以能和 PSI 对账的是**外层**那个数，不是内层。
+> 内层单独测出来的意义在于把"卡顿花在扫描上"和"卡顿花在排队上"分开 ——
+> 这两件事的优化方向相反：扫描慢要改回收策略，排队久说明 kswapd 追不上、该调水位。
+>
+> **教训（和 P0 那次同类但更深一层）**：P0 学到的是"早退分支可能在埋点之前"；
+> 这次学到的是"**早退条件可能不在调用点，而在被调函数末尾** ——
+> `if (f()) return;` 这种写法，读调用点读不出 `f()` 到底什么时候返回真"。
 
 #### ② tracepoint 字段（从 `/usr/src/.../include/trace/events/vmscan.h` 读的）
 
@@ -1372,31 +1423,173 @@ full total = 6499962 µs = 6.50 s
 #### 由此确定的 P1 对账等式（写探针之前必须先定死）
 
 ```
-kretprobe(try_to_free_pages) 次数 = begin 次数 + throttle 早退次数     (vmscan.c:3570)
-Σ allocstall_*(四个桶)           = begin 次数 + do_try_to_free_pages 内部 retry 次数
+✗ kretprobe(try_to_free_pages) 次数 = begin 次数 + throttle 早退次数    ← 2026-08-17 已证伪
+Σ allocstall_*(四个桶)              = begin 次数 + do_try_to_free_pages 内部 retry 次数
 ```
+
+> **第一条是错的**，更正见 7.2 ① 那个 ⚠️ 块。正确的一组是：
+>
+> ```
+> kretprobe 次数 = begin 次数 + 被限流且期间收到致命信号的次数（通常 0）
+> 被限流次数     = /proc/vmstat 的 pgscan_direct_throttle          (vmscan.c:3515)
+> 外层耗时 − 内层耗时 = 被限流睡掉的时间                            (:3527 / :3530)
+> Σ 外层耗时     ≈ /proc/pressure/memory 的 total 增量（**不是恒等式**，见 7.9 ③）
+> ```
 
 第二条的修正项来自 `do_try_to_free_pages` 里的 `retry:` 标签（:3330），
 **ALLOCSTALL 的计数点 :3334 在 retry 标签之后** —— 同一次调用可能计多次。
 两个 `goto retry` 都在"这一轮什么都没回收到"的兜底路径上（:3396 / :3405）。
+所以只能写成不等式 `Σallocstall_* ≥ begin 次数`，差额就是 retry 次数。
 
 > 和 P0 的 `compact_stall == outer_exit − SKIPPED` 是同一个形状：
 > **对账等式基本都不是恒等式，一定要先找出修正项。**
-> 本轮实测 `pgscan_direct_throttle = 0`，所以第一条这次会退化成相等 ——
-> **但那是巧合，不能写成恒等式**（P0 已经在这上面栽过一次）。
+> 本轮实测 `pgscan_direct_throttle = 0`，所以第一条那个错版本这次**会退化成相等** ——
+> 如果没去读 `throttle_direct_reclaim()` 的函数体，
+> 这个错等式会在实测中"通过"，然后被当成已验证的结论写进报告。
+> **这是本项目第二次遇到"错误的自检恰好通过"**（第一次是 memhog 的 allocstall 分桶）。
 
-### 7.8 待办
+### 7.9 探针与展示层落地（2026-08-17）
+
+#### ① `format` 实测结果（用户跑的 sudo，不是抄头文件）
+
+```
+mm_vmscan_direct_reclaim_begin   ID: 529
+  field:int   order;         offset:8;   size:4;  signed:1
+  field:gfp_t gfp_flags;     offset:12;  size:4;  signed:0
+
+mm_vmscan_direct_reclaim_end     ID: 526
+  field:unsigned long nr_reclaimed;  offset:8;  size:8;  signed:0
+```
+
+头文件这次没骗人，字段名和类型都对得上。但有一个坑值得单独记：
+**`begin` 的两个字段都是 4 字节，`end` 的 `nr_reclaimed` 是 8 字节 `unsigned long`。**
+照 `begin` 的模式想当然写成 `u32`，在小端机上会读到低 32 位 ——
+页数不大时**看起来完全正常**，只在溢出时才暴露。
+这种错误不会自己现形，只能靠实测 `format` 来防。两边都从 offset 8 起，无 padding。
+
+顺带发现：BCC 的 `TRACEPOINT_PROBE` 是**读 tracefs 的 `format` 文件现场生成 `args`
+结构体**的。所以非 root 连编译都过不去（只有前向声明，报
+`incomplete definition of type`）—— 这也反过来说明字段名必须和 `format` 完全一致。
+
+#### ② ★ 发现 `ksrc-5.15.178/` 是不完整的源码树
+
+```
+ksrc-5.15.178/
+└── mm/
+    ├── compaction.c
+    ├── internal.h
+    ├── page_alloc.c
+    └── vmscan.c          ← 总共只有 3 个 .c
+```
+
+**所以本记录里凡是写"全内核 grep 确认"的地方都要打折。**
+2026-08-17 一度在 `reclaiminfo.c` 的注释里写了"全内核 `try_to_free_pages`
+只有一个调用者，已 grep 确认"—— 那是**言过其实**，实际只 grep 了这 3 个文件。
+
+本机真正能验证到的（换了个思路，从符号导出入手）：
+
+| 事实 | 来源 | 说明 |
+|---|---|---|
+| 声明在 `include/linux/swap.h:379` | 内核头文件包 | 有声明 |
+| `/proc/kallsyms` 里是 `T` | 本机 | 全局符号，kprobe 挂得上 |
+| **不在 `Module.symvers` 里** | 内核头文件包 | ★ 没 `EXPORT_SYMBOL` → **任何可加载模块都调不到它**，调用者只可能在内建代码里 |
+| 这 3 个 mm 文件里唯一调用点是 `page_alloc.c:4657` | 本机 grep | 在 `__perform_reclaim()` 内 |
+
+剩下的缺口（`fs/`、`drivers/` 等内建代码有没有调它）本地验证不了。
+**处理办法不是假设它成立，而是让它变成运行时可测的**：
+`reclaiminfo.c` 里加了 `BPF_STACK_TRACE(caller_stacks)`，
+每次进入 `try_to_free_pages` 记一条内核栈，用户态用 `/proc/kallsyms` 解析。
+输出里只有一条栈 → 前提被实测证实；出现第二条 → 结论推翻，外层对账要重算。
+
+> 这条比"读源码确认"强，因为它在**目标内核上直接测**，
+> 不依赖手上这份源码是不是完整、是不是同一个版本。
+
+#### ③ PSI 交叉校验的**真实强度**（别把它说过头）
+
+原先记的是"eBPF 测出的总延迟 ≈ `/proc/pressure/memory` 增量"。
+查了 `psi_memstall_enter` 的全部调用点，这话要缩水：
+
+| 位置 | 属于谁 | 本工具覆盖？ |
+|---|---|---|
+| `page_alloc.c:4653` | **直接回收** | ✅ 我们 |
+| `page_alloc.c:4395` | 直接规整 | ❌（那是 P0） |
+| `vmscan.c:3898` | **kswapd**（`balance_pgdat`） | ❌ |
+| `vmscan.c:4514` | node reclaim（`__node_reclaim`） | ❌（本机 `zone_reclaim_mode=0`，不贡献） |
+| `compaction.c:2960` | kcompactd | ❌ |
+
+两个方向的偏差**同时存在**：
+
+1. **PSI 口径更宽** → PSI 偏大。memhog 那三轮 `pswpout=85713`，kswapd 极忙，
+   `vmscan.c:3898` 那一处的贡献可能远超我们这一处。
+   所以 7.7 里记的"8.39 s / 504 次 = 16.6 ms 每次"**不能当作直接回收的平均延迟** ——
+   那个 8.39 s 里有大量 kswapd 的份。这个数只能当上界。
+2. **PSI `some` 是墙钟** → 本工具偏大。N 个线程同时卡住，PSI 只算一份时间，
+   本工具是逐次求和。8 线程压力下本工具的总和可以是 PSI 的好几倍。
+
+> **结论：这条校验能发现的是数量级错误（比如差 1000 倍 = 单位搞错了），
+> 不能证明数字精确。** 已按这个措辞写进 `extfrag.py` 的输出里，
+> 避免以后自己看输出时又把它当成强校验。
+
+#### ④ 写了什么
+
+**`源码/src/bpf/reclaiminfo.c`（新建）**：2 个 tracepoint + 1 对 kprobe/kretprobe
++ 1 个调用栈诊断。**没有来源过滤器**（埋点本身就是 direct 专用），
+**没有"内层向外层借 order"**（begin 自带 order）。
+
+12 格 `stat_map`，其中 4 格是**预期恒为 0 的自检位**：
+
+| 自检位 | 非 0 意味着 |
+|---|---|
+| `order_mismatch` | 外层 kprobe 从寄存器取的 order ≠ begin 报的 order → `PT_REGS_PARM2` 取参假设错了。**这是免费的自证**：同一个值走两条独立路径拿到，对不上就是取参错。错了不会崩，只会让直方图悄悄归错维度。 |
+| `no_direct_reclaim` | gfp 里没 `__GFP_DIRECT_RECLAIM`，与"直接回收必然允许阻塞"矛盾 |
+| `begin_no_outer` | 有 begin 没外层记录 → 若持续增长，说明有别的调用者 |
+| （`ret_one` 不是 0/非 0 判断） | `:3570` 的早退是 `return 1`，而正常路径也可能真回收了 1 页。单看返回值分不出来，要靠**有没有配上 begin** 消歧 |
+
+**`源码/src/extfrag.py`（改，不新开 py 文件）**：
+- `read_vmstat` / `read_psi` / `vmstat_delta`：取不到的键返回 **-1 / None，不返回 0**
+  （返回 0 会让"没这个计数器"和"计数器真是 0"变成同一个值，让自检**假通过**）
+- vmstat 基线在 `BPF()` **之后**取：BCC 现场调 clang 要一两秒，
+  基线放前面会凭空差出一截。残留偏差方向固定：eBPF 可能多算，不会少算
+- `print_reclaim()`：`--mode reclaim` 的文本输出
+- **补上了简历第 2/3 点欠的那段**：`print_compact()` 现在自己读 vmstat，
+  自动验 `compact_stall == 外层退出 − SKIPPED` 这条恒等式，
+  并算双扫描器扫描比（>2 找空位难 / <0.5 UNMOVABLE 指纹 / 中间正常）
+
+#### ⑤ 写代码过程中发现的两个自己的 bug
+
+| bug | 后果 | 为什么危险 |
+|---|---|---|
+| `_fmt_hist()` 把单位硬编码成 `μs` | "每次回收到的页数"直方图被标成 `8 ~ 15 μs`，**页数显示成时间** | 程序不崩，只让**读的人**得出错误结论；截图进报告后基本发现不了。已加 `unit` 参数 |
+| `pgscan_direct` 增量为 0 时打印"每回收 1 页要扫 0.0 页" | 用一个荒谬的比值掩盖了"两个来源互相矛盾"这件事 | 同上：不报错，只是悄悄输出假数。已改成显式报矛盾 |
+
+两个都属于同一类：**输出层的错误不会被程序自己发现**。
+
+#### ⑥ 验证到哪一步了（诚实划线）
+
+| 项 | 状态 |
+|---|---|
+| C 代码 clang 编译 | ✅ 零错误（用手工补的 `args` 结构体绕开 tracefs 权限，见 ① ） |
+| BPF verifier 接受 | ❌ **未验证，要 root** |
+| `print_reclaim` 全分支能跑 | ✅ 用假 BPF 后端跑通，两个显示 bug 就是这么抓到的 |
+| `print_compact` 改动未回归 | ✅ 同上 |
+| 运行时数字正确 | ❌ **未验证**，等正式观测轮 |
+
+### 7.10 待办
 
 - [x] **硬门槛：`pgscan_direct` 增量 > 0** —— 通过（491 次事件，方案 A）
-- [ ] **需要 root，AI 跑不了**：实测两个 tracepoint 的 `format` 文件
-      （字段名、类型、offset 有没有 padding）
-- [x] `try_to_free_pages` 是全局符号 —— `/proc/kallsyms` 里是 `T`，kretprobe 挂得上
+- [x] 实测两个 tracepoint 的 `format` 文件（用户跑 sudo，见 7.9 ①）
+- [x] `try_to_free_pages` 是全局符号 —— `/proc/kallsyms` 里是 `T`，kprobe 挂得上
       （`do_try_to_free_pages` 是 `t`，挂不了，正好也不需要）
-- [ ] 写 `源码/src/bpf/reclaiminfo.c`
-- [ ] `extfrag.py` 加 `--mode reclaim` 分支（不新开 py 文件）
+- [x] 写 `源码/src/bpf/reclaiminfo.c`
+- [x] `extfrag.py` 加 `--mode reclaim` 分支（不新开 py 文件）
+- [x] `extfrag.py` 补双扫描器扫描比 + `compact_stall` 自动对账（简历第 2/3 点靠它兑现）
+- [ ] **需要 root**：让 verifier 过一遍
+      `sudo python3 源码/src/extfrag.py --mode reclaim --duration 5`
+      —— 这一步只验"挂得上、不崩"，不看数字
 - [ ] 正式观测轮：**先挂探针 → 再跑 memhog → 结束后拷证据出来**（顺序不可颠倒）
       建议参数 `--gb 11 --threads 8 --goal 999999999 --floor 800 --hold 60`
       （floor 抬到 800，别再压到 84 MB）
+- [ ] 写 `报告_P1.md`
 
 ---
 
@@ -1406,5 +1599,9 @@ kretprobe(try_to_free_pages) 次数 = begin 次数 + throttle 早退次数     (
 - [x] 写 `源码/src/bpf/compactinfo.c`(P0)
 - [x] 装内核源码核实两条存疑项（`ksrc-5.15.178`,**不进仓库**）
 - [ ] 补齐 fragstress 档位 2/3/4 的剩余文件（`sockflood.c` / `dentry.sh` / `thpload.c`,优先级低于 P1）
-- [ ] `extfrag.py` 补 15 行：从 `/proc/vmstat` 读 `compact_migrate_scanned` /
-      `compact_free_scanned` 算扫描比（现在这段逻辑只在 `run.sh` 里,简历第 2/3 点靠它兑现）
+- [x] `extfrag.py` 补 15 行：从 `/proc/vmstat` 读 `compact_migrate_scanned` /
+      `compact_free_scanned` 算扫描比（2026-08-17 完成，实际写成了 vmstat 对账一整节；
+      顺带发现一个缺陷：vmstat 的 scanned 是**全局**的、含 kcompactd 的份，
+      而 eBPF 侧过滤掉了 kcompactd —— 两边人口不同，所以
+      "每搬走 1 页扫 N 页"是混了两拨人口的数，只能当数量级看。
+      工具会打印 `compact_daemon_wake` 增量让人判断污染有多重）

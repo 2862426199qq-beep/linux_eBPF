@@ -54,8 +54,87 @@ class ExtFrag:
         'frag':    'fraginfo.c',       # v1 主线：现在有多碎（kprobe 全量扫 zone×order）
         'extfrag': 'extfraginfo.c',    # v1 支线：谁在制造碎片（跨 migratetype fallback）
         'compact': 'compactinfo.c',    # v2 P0：规整代价多大、成功率多少
-        'reclaim': 'reclaiminfo.c',    # v2 P1：直接回收代价多大（尚未实现）
+        'reclaim': 'reclaiminfo.c',    # v2 P1：直接回收代价多大
     }
+
+    # ------------------------------------------------------------------
+    # /proc/vmstat 里需要对账的计数器
+    #
+    # 为什么工具自己要读 vmstat：
+    #   eBPF 数出来的数字**没有第二个来源就无法证伪**。P0 阶段发现的
+    #   "compact_stall == 外层退出 − COMPACT_SKIPPED 次数"这条等式，
+    #   就是靠 vmstat 才能验的。原来这个对账要人工做（拿工具输出去和
+    #   `grep compact /proc/vmstat` 比），漏做一次就等于没有自证。
+    #
+    # 为什么两套 mode 的键放在一个集合里：
+    #   读一次 /proc/vmstat 的成本和读几个键无关（seq_file 一次生成全部），
+    #   分开反而多一次 open/read。
+    # ------------------------------------------------------------------
+    VMSTAT_KEYS = (
+        # --- compact（P0）---
+        'compact_stall', 'compact_success', 'compact_fail',
+        'compact_daemon_wake', 'compact_isolated',
+        'compact_migrate_scanned', 'compact_free_scanned',
+        # --- reclaim（P1）---
+        'pgscan_direct', 'pgsteal_direct', 'pgscan_direct_throttle',
+        'allocstall_dma', 'allocstall_dma32',
+        'allocstall_normal', 'allocstall_movable',
+    )
+
+    @classmethod
+    def read_vmstat(cls):
+        """读一次 /proc/vmstat，只取 VMSTAT_KEYS 里的键
+
+        ★ 取不到的键返回 -1 而**不是 0**。
+          返回 0 会让"这台机器没这个计数器"和"这个计数器真的是 0"
+          变成同一个值，增量算出来是假的 0 —— 而假的 0 会让自检
+          "恰好通过"。fragstress/memhog.c 的 read_kv() 是同一个约定。
+        """
+        out = {k: -1 for k in cls.VMSTAT_KEYS}
+        try:
+            with open('/proc/vmstat') as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] in out:
+                        out[parts[0]] = int(parts[1])
+        except OSError as e:
+            print(f"！读 /proc/vmstat 失败（{e}），vmstat 对账这一节不可信")
+        return out
+
+    @staticmethod
+    def read_psi():
+        """读 /proc/pressure/memory，返回 {'some': total_us, 'full': total_us}
+
+        PSI 是内核**独立统计**的内存压力，不经过我们的探针 ——
+        所以它是 P1 唯一的第三方交叉校验来源。格式：
+            some avg10=0.00 avg60=0.00 avg300=0.00 total=8391452
+            full avg10=0.00 avg60=0.00 avg300=0.00 total=6499962
+        total 单位是微秒。取不到返回 None（不返回 0，理由同 read_vmstat）。
+        """
+        out = {}
+        try:
+            with open('/proc/pressure/memory') as f:
+                for line in f:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    for p in parts[1:]:
+                        if p.startswith('total='):
+                            out[parts[0]] = int(p[6:])
+        except OSError:
+            return None            # 内核没开 CONFIG_PSI，或没这个文件
+        return out or None
+
+    @staticmethod
+    def vmstat_delta(base, now, key):
+        """算增量；任一端缺失（-1）就返回 None，由调用方显式说"没这个数"
+
+        不返回 0：见 read_vmstat 的说明。
+        """
+        b, n = base.get(key, -1), now.get(key, -1)
+        if b < 0 or n < 0:
+            return None
+        return n - b
 
     def __init__(self, interval=2, output_extfrag_index=False,
                  output_unusable_index=False, output_count=False,
@@ -94,6 +173,16 @@ class ExtFrag:
         if not os.path.exists(src):
             raise FileNotFoundError(f"mode={mode} 需要的源文件不存在：{src}")
         self.b = BPF(src_file=src)
+
+        # ★ vmstat 基线必须在 BPF() **之后**取，不能在之前。
+        #   BCC 是加载时现场调 clang 编译的，BPF() 这一步要花一两秒；
+        #   基线放在它前面，这一两秒里发生的事件会进 vmstat 增量却没进
+        #   eBPF 计数，对账凭空差出一截。放在后面，偏差窗口只剩
+        #   "探针挂好" 到 "open(/proc/vmstat)" 之间的几微秒。
+        #   残留偏差的方向是固定的：**eBPF 可能多算，不会少算**
+        #   （窗口内的事件探针抓到了，但已被算进基线）。
+        self.vmstat_base = self.read_vmstat()
+        self.psi_base = self.read_psi()
 
         # 将采集间隔写入 eBPF 侧的 delay_map
         #
@@ -395,6 +484,25 @@ class ExtFrag:
         'no_direct_reclaim',  # 9 gfp 里没有 __GFP_DIRECT_RECLAIM（预期恒为 0）
     ]
 
+    # reclaiminfo.c 的 stat_map 下标，必须与那边的 S_* 宏逐一对应
+    RECL_STAT_NAMES = [
+        'outer_enter',      # 0 进入 try_to_free_pages
+        'outer_exit',       # 1 从 try_to_free_pages 返回（kretprobe 命中）
+        'outer_unpaired',   # 2 ★ kretprobe 找不到入口记录
+        'begin',            # 3 begin 埋点命中
+        'begin_no_outer',   # 4 ★ begin 找不到外层记录（前提被推翻的信号之一）
+        'order_mismatch',   # 5 ★ kprobe 取的 order ≠ begin 报的 order（预期 0）
+        'end_accept',       # 6
+        'end_unpaired',     # 7 ★ end 找不到 begin
+        'zero_reclaim',     # 8 卡了一趟但一页没回收到
+        'throttle_slept',   # 9 疑似被限流睡过
+        'ret_one',          # 10 返回值 = 1（有歧义，见 reclaiminfo.c 头部第四节）
+        'no_direct_reclaim',  # 11 gfp 里没有 __GFP_DIRECT_RECLAIM（预期 0）
+    ]
+
+    # sum_map 的下标，与 reclaiminfo.c 的 R_* 宏对应
+    RECL_SUM_NAMES = ['pages', 'outer_ns', 'inner_ns', 'throttle_ns']
+
     def _hist_to_dict(self, table, dim_field):
         """把带二维 key 的 BPF_HISTOGRAM 读成 {维度值: {log2桶: 计数}}
 
@@ -456,8 +564,14 @@ class ExtFrag:
         }
 
     @staticmethod
-    def _fmt_hist(buckets, label):
-        """把 {log2桶: 计数} 渲染成一行行文本直方图"""
+    def _fmt_hist(buckets, label, unit='μs'):
+        """把 {log2桶: 计数} 渲染成一行行文本直方图
+
+        ★ unit 必须由调用方给：本函数原来把单位硬编码成 'μs'，
+          结果 P1 的"每次回收到的页数"直方图被标成了「8 ~ 15 μs」——
+          页数被当成时间显示。这种错误不会让程序崩，只会让**读的人**
+          得出错误结论，而且截图进报告后很难再发现。
+        """
         if not buckets:
             return ["    （无样本）"]
         lines = []
@@ -467,7 +581,7 @@ class ExtFrag:
             hi = (1 << slot) - 1
             n = buckets[slot]
             bar = '*' * max(1, int(40 * n / peak))
-            lines.append(f"    {lo:>8} ~ {hi:<8} μs | {n:>7} |{bar}")
+            lines.append(f"    {lo:>8} ~ {hi:<8} {unit} | {n:>7} |{bar}")
         return lines
 
     def print_compact(self):
@@ -477,13 +591,16 @@ class ExtFrag:
         """
         d = self.get_compact_data()
         s = d['stat']
+        vm = self.read_vmstat()          # 现在的 vmstat，和 self.vmstat_base 比
 
         print("=" * 72)
         print("direct compaction 统计（只统计被同步卡住的进程，已排除 kcompactd 与手动规整）")
         print("=" * 72)
 
+        d_stall = self.vmstat_delta(self.vmstat_base, vm, 'compact_stall')
         print(f"外层进入 try_to_compact_pages : {s['outer_enter']}"
-              "   ← 拿这个和 /proc/vmstat 的 compact_stall 对账")
+              f"   ← 对账 /proc/vmstat compact_stall 增量 = "
+              f"{'（读不到）' if d_stall is None else d_stall}")
         print(f"外层退出（kretprobe）         : {s['outer_exit']}")
         print(f"内层 begin 接纳 / 被过滤      : {s['begin_accept']} / {s['begin_reject']}")
         print(f"内层 end   接纳               : {s['end_accept']}")
@@ -522,6 +639,114 @@ class ExtFrag:
               f"{'  → 迁移失败率 %.1f%%' % (100 * d['failed'] / (d['migrated'] + d['failed'])) if (d['migrated'] + d['failed']) else ''}")
         print()
 
+        # ------------------------------------------------------------------
+        # ★ 与 /proc/vmstat 对账（第三方来源，用来证伪 eBPF 自己的数）
+        # ------------------------------------------------------------------
+        print("与 /proc/vmstat 对账：")
+
+        # ① compact_stall 恒等式。
+        #    内核在 page_alloc.c:4409 判到 COMPACT_SKIPPED 会**早退**，
+        #    而早退发生在入口 tracepoint 之前 —— 但 kretprobe 挂在函数返回上，
+        #    照样命中。所以：
+        #        compact_stall = 外层退出 − COMPACT_SKIPPED 次数
+        #    这不是"应该差不多"，是能对上整数的等式。对不上就是有 bug。
+        n_skipped = d['attempt_status'].get('SKIPPED', 0)
+        expect_stall = s['outer_exit'] - n_skipped
+        if d_stall is None:
+            print("  ！读不到 compact_stall，stall 恒等式无法验证")
+        elif d_stall == expect_stall:
+            print(f"  ✓ compact_stall 恒等式成立：{d_stall} = 外层退出 {s['outer_exit']}"
+                  f" − SKIPPED {n_skipped}")
+        else:
+            print(f"  ！compact_stall 恒等式不成立：vmstat {d_stall} ≠ "
+                  f"{expect_stall}（外层退出 {s['outer_exit']} − SKIPPED {n_skipped}）"
+                  f"，差 {d_stall - expect_stall}")
+            print("    → 可能原因：观测窗口内有别的进程也在规整（本工具只过滤 "
+                  "kcompactd 和手动规整，不区分进程）；或早退路径的理解有误。")
+
+        # ② stall = success + fail（内核自己的三个计数器之间的关系）
+        d_succ = self.vmstat_delta(self.vmstat_base, vm, 'compact_success')
+        d_fail = self.vmstat_delta(self.vmstat_base, vm, 'compact_fail')
+        if None not in (d_stall, d_succ, d_fail):
+            mark = '✓' if d_stall == d_succ + d_fail else '！'
+            print(f"  {mark} compact_stall {d_stall} vs success {d_succ}"
+                  f" + fail {d_fail} = {d_succ + d_fail}")
+            if d_stall != d_succ + d_fail:
+                print("    → 这三个计数器由内核在同一处更新，对不上说明采样窗口"
+                      "跨越了别的规整活动")
+
+        # ③ ★ 双扫描器扫描量与扫描比 —— 判别"碎片的性质"，不是"碎片的多少"
+        #
+        #   规整的机制是两个扫描器对着走（compaction.c）：
+        #     migrate 扫描器从 pageblock 低地址往高走，找**可移动的页**；
+        #     free    扫描器从高地址往低走，找**空位**；
+        #   两者相遇即本次结束。所以两边扫的量之比反映的是"哪一边稀缺"：
+        #
+        #     比值 > 2    找空位难 → 空闲块本身不够（内存真的满了/太碎）
+        #     0.5 ~ 2     两边都在正常干活
+        #     比值 < 0.5  找可移动页难 → 扫过的大多搬不走
+        #                 = UNMOVABLE 页散布的指纹（这是最坏的碎片形态：
+        #                   规整对它无效，因为内核自己的页搬不动）
+        #
+        #   为什么扫描量只能从 vmstat 取、不能从 tracepoint 算：
+        #     mm_compaction_begin/end 带的是两个扫描器的 pfn 位置，
+        #     但 compaction 中途会 **重启扫描器**，硬拿 pfn 相减会得出
+        #     负数或荒谬的巨大值（见 compactinfo.c:455 的说明）。
+        #     compact_migrate_scanned / compact_free_scanned 是内核逐页累加的，
+        #     不受重启影响 —— 所以这两个数**只有这一个可信来源**。
+        #
+        #   ★★ 但这两个来源的**统计人口不一样**，这是个必须写出来的缺陷：
+        #     eBPF 侧过滤掉了 kcompactd 和手动规整，只留被同步卡住的进程；
+        #     vmstat 的两个 scanned 计数器**是全局的，kcompactd 扫的也算进去**。
+        #     所以：
+        #       · 扫描比本身仍然可读 —— 它描述的是"这段时间内，这台机器上
+        #         所有规整活动"面对的是哪种碎片，是个环境属性；
+        #       · 但"每搬走 1 页扫 N 页"是**混了两拨人口的数**（分子含
+        #         kcompactd 的扫描量，分母只有 direct compaction 的迁移量），
+        #         只能当数量级参考，不能当 direct compaction 的性价比报出去。
+        #     判断污染有多重：看下面打印的 compact_daemon_wake 增量。
+        #     它是 0 才说明这段时间只有 direct compaction 在动。
+        d_ms = self.vmstat_delta(self.vmstat_base, vm, 'compact_migrate_scanned')
+        d_fs = self.vmstat_delta(self.vmstat_base, vm, 'compact_free_scanned')
+        print()
+        print("双扫描器（判别碎片性质，唯一可信来源是 vmstat，见上方注释）：")
+        if d_ms is None or d_fs is None:
+            print("  ！读不到 compact_migrate_scanned / compact_free_scanned")
+        elif d_ms == 0 and d_fs == 0:
+            print("  两个扫描器都没动 —— 本窗口内没有实际发生的规整"
+                  "（可能全是 SKIPPED 早退）")
+        else:
+            print(f"  migrate 扫描 {d_ms} 页 / free 扫描 {d_fs} 页")
+            # 人口污染检查：vmstat 的 scanned 是全局的，kcompactd 也算进去
+            d_wake = self.vmstat_delta(self.vmstat_base, vm, 'compact_daemon_wake')
+            if d_wake is None:
+                print("  ！读不到 compact_daemon_wake，无法判断 kcompactd 污染程度")
+            elif d_wake == 0:
+                print("  ✓ compact_daemon_wake 增量 0：这段扫描量全部来自"
+                      "被卡住的进程，和 eBPF 侧同一拨人口")
+            else:
+                print(f"  ！compact_daemon_wake 增量 {d_wake}："
+                      "扫描量里混进了 kcompactd 的份")
+                print("    → 扫描比仍可读（它描述环境），但下面那个"
+                      "\"每搬走 1 页扫 N 页\"分子分母人口不同，只当数量级看")
+            if d_fs == 0:
+                print("  ！free 扫描量为 0 而 migrate 非 0：比值无意义，不做解读")
+            else:
+                ratio = d_ms / d_fs
+                if ratio > 2:
+                    verdict = "找空位难 → 空闲块不够（内存满或极碎）"
+                elif ratio < 0.5:
+                    verdict = ("★ 找可移动页难 → 扫过的大多搬不走，"
+                               "UNMOVABLE 散布的指纹；规整对这种碎片基本无效")
+                else:
+                    verdict = "两边都在正常干活"
+                print(f"  扫描比 migrate/free = {ratio:.2f}  → {verdict}")
+                # 每次迁移要扫多少页 —— 规整的"性价比"
+                if d['migrated']:
+                    print(f"  每搬走 1 页平均要扫 "
+                          f"{(d_ms + d_fs) / d['migrated']:.1f} 页")
+        print()
+
         # ★ 交叉校验：直方图里的样本总数，应当等于"外层退出数 − 外层未配对数"。
         #   不相等就说明有样本被静默丢掉了（最可能是直方图 map 满了 ——
         #   BCC 的 increment() 失败时不报错、没有返回值可查）。
@@ -548,6 +773,275 @@ class ExtFrag:
         for sync in sorted(d['zone_lat']):
             print(f"  sync = {sync}  （{'同步迁移' if sync else '异步迁移'}）")
             for line in self._fmt_hist(d['zone_lat'][sync], 'sync'):
+                print(line)
+
+    # ========================================================================
+    # P1：direct reclaim
+    # ========================================================================
+
+    def get_reclaim_data(self):
+        """读 reclaiminfo.c 的所有 map"""
+        stat = {}
+        for i, name in enumerate(self.RECL_STAT_NAMES):
+            stat[name] = self.b["stat_map"][ctypes.c_int(i)].value
+        summ = {}
+        for i, name in enumerate(self.RECL_SUM_NAMES):
+            summ[name] = self.b["sum_map"][ctypes.c_int(i)].value
+
+        # 调用者栈：{解析后的栈文本: 次数}
+        callers = {}
+        try:
+            stacks = self.b["caller_stacks"]
+            for k, v in self.b["caller_count"].items():
+                sid = k.value
+                try:
+                    frames = [self.b.ksym(a).decode('utf-8', 'replace')
+                              if isinstance(self.b.ksym(a), bytes)
+                              else str(self.b.ksym(a))
+                              for a in stacks.walk(sid)]
+                except Exception:
+                    frames = [f"（栈 {sid} 解析失败）"]
+                callers[' ← '.join(frames[:6])] = v.value
+        except KeyError:
+            pass          # 没有这两个 map（不该发生，但不让它把整个输出搞崩）
+
+        return {
+            'stat': stat,
+            'sum': summ,
+            'outer_lat': self._hist_to_dict(self.b["outer_lat"], 'order'),
+            'inner_lat': self._hist_to_dict(self.b["inner_lat"], 'order'),
+            'recl_hist': self._hist_to_dict(self.b["recl_hist"], 'order'),
+            'callers': callers,
+        }
+
+    def print_reclaim(self):
+        """把 direct reclaim 统计打印成纯文本"""
+        d = self.get_reclaim_data()
+        s, sm = d['stat'], d['sum']
+        vm = self.read_vmstat()
+
+        print("=" * 72)
+        print("direct reclaim 统计（内核埋点本身就是 direct 专用，无需过滤 "
+              "kswapd / memcg）")
+        print("=" * 72)
+
+        print(f"外层进入 try_to_free_pages : {s['outer_enter']}")
+        print(f"外层退出（kretprobe）      : {s['outer_exit']}")
+        print(f"内层 begin / end           : {s['begin']} / {s['end_accept']}")
+        print()
+
+        # ---------------- 未配对率：延迟分布可不可信的前提 ----------------
+        # lru_hash 满了淘汰的是**停留最久**的表项，也就是延迟最长的样本。
+        # 不报这个数，下面的延迟直方图就是不可信的 —— 硬要求，不是可选项。
+        unpaired = s['outer_unpaired'] + s['end_unpaired']
+        rate = (unpaired / s['outer_enter']) if s['outer_enter'] else 0.0
+        print(f"★ 未配对率                 : {rate * 100:.2f}%"
+              f"（外层 {s['outer_unpaired']} + 内层 {s['end_unpaired']}）")
+
+        # ---------------- 几个"预期恒为 0"的自检格 ----------------
+        print()
+        print("自检（下面每一格预期都是 0，非 0 表示对内核路径的理解有误）：")
+        if s['order_mismatch']:
+            print(f"  ！order_mismatch = {s['order_mismatch']}："
+                  "外层 kprobe 从寄存器取的 order 和 begin 埋点报的不一致")
+            print("    → PT_REGS_PARM2 的取参假设错了（函数签名或调用约定变了）。"
+                  "所有按 order 分维度的直方图都归错桶了，不可信。")
+        else:
+            print("  ✓ order_mismatch = 0：两条独立路径拿到的 order 一致，"
+                  "取参假设成立")
+        if s['no_direct_reclaim']:
+            print(f"  ！no_direct_reclaim = {s['no_direct_reclaim']}："
+                  "gfp 里没有 __GFP_DIRECT_RECLAIM，与'直接回收必然允许阻塞'矛盾")
+        else:
+            print("  ✓ no_direct_reclaim = 0")
+        if s['begin_no_outer']:
+            print(f"  ！begin_no_outer = {s['begin_no_outer']}："
+                  "有 begin 却没有对应的外层记录")
+            print("    → 若持续增长，说明 try_to_free_pages 之外还有别的代码"
+                  "在打这个 tracepoint，外层-内层对账要重做（见下方调用者栈）")
+        else:
+            print("  ✓ begin_no_outer = 0")
+
+        # ---------------- ★ 调用者栈：把一个假设变成实测 ----------------
+        # 见 reclaiminfo.c 头部第二节：本机源码树只有 3 个 mm 文件，
+        # "try_to_free_pages 只有一个调用者"这句话本地验证不了，
+        # 所以直接把调用栈测出来。
+        print()
+        print("★ 谁在调 try_to_free_pages（实测调用栈，不是靠读源码假设的）：")
+        if not d['callers']:
+            print("    （没有样本）")
+        else:
+            for stack, n in sorted(d['callers'].items(), key=lambda x: -x[1]):
+                print(f"    {n:>7} 次  {stack}")
+            if len(d['callers']) == 1:
+                print("  ✓ 只有一条调用栈 → '唯一调用者'这个前提被实测证实，"
+                      "外层探针确实不需要来源过滤")
+            else:
+                print(f"  ！出现 {len(d['callers'])} 条不同调用栈 —— 注意其中"
+                      "可能只是内联/栈深度差异，要看函数名是否真的不同。")
+                print("    若确实存在第二个调用者，'外层不需要过滤'的结论必须推翻。")
+
+        # ---------------- 限流：外层与内层的差额 ----------------
+        # ★ vmscan.c:3569 那行 `if (throttle_direct_reclaim(...)) return 1;`
+        #   看着像"被限流就早退"，其实 throttle_direct_reclaim 只在
+        #   fatal_signal_pending 时才返回 true（:3533）；正常被限流的进程是
+        #   在 :3530 wait_event_killable 睡一觉，醒来继续走到 begin。所以：
+        #       外层退出 − begin = 被限流**且期间收到致命信号**的次数（通常 0）
+        #       真正的被限流次数 = /proc/vmstat 的 pgscan_direct_throttle
+        print()
+        print("限流（throttle_direct_reclaim）：")
+        early = s['outer_exit'] - s['begin']
+        d_thr = self.vmstat_delta(self.vmstat_base, vm, 'pgscan_direct_throttle')
+        print(f"  外层退出 − begin = {early}"
+              "   ← 这是'被限流且收到致命信号'的次数，不是被限流总次数")
+        print(f"  pgscan_direct_throttle 增量 = "
+              f"{'（读不到）' if d_thr is None else d_thr}"
+              "   ← 这才是被限流总次数（:3515 在睡之前就计了）")
+        if d_thr == 0 and s['throttle_slept'] == 0:
+            print("  → 本轮完全没有限流发生，所以'外层 − 内层'里没有睡眠成分，"
+                  "那点差额只是两个探针之间几行代码的开销")
+        elif d_thr:
+            print(f"  → 发生了限流。疑似睡过的次数（外层−内层 > 1ms）："
+                  f"{s['throttle_slept']}")
+
+        # ---------------- 时间的分解 ----------------
+        print()
+        outer_s = sm['outer_ns'] / 1e9
+        inner_s = sm['inner_ns'] / 1e9
+        queue_s = sm['throttle_ns'] / 1e9
+        print("时间去哪了：")
+        print(f"  外层总耗时（进程实际被卡住）: {outer_s:.3f} s")
+        print(f"  内层总耗时（纯扫描）        : {inner_s:.3f} s")
+        if outer_s > 0:
+            print(f"  差额（排队/限流）           : {queue_s:.3f} s"
+                  f"  = 外层的 {100 * queue_s / outer_s:.1f}%")
+        else:
+            print(f"  差额（排队/限流）           : {queue_s:.3f} s")
+        if s['outer_exit']:
+            print(f"  平均每次被卡住              : "
+                  f"{outer_s * 1000 / s['outer_exit']:.2f} ms")
+
+        # ---------------- 回收的产出 ----------------
+        print()
+        print("回收到了什么：")
+        print(f"  累计回收页数（本工具）      : {sm['pages']}"
+              f"  = {sm['pages'] * 4 / 1024:.1f} MB")
+        d_steal = self.vmstat_delta(self.vmstat_base, vm, 'pgsteal_direct')
+        d_scan = self.vmstat_delta(self.vmstat_base, vm, 'pgscan_direct')
+        if d_steal is not None:
+            diff = sm['pages'] - d_steal
+            mark = '✓' if abs(diff) <= max(16, abs(d_steal) * 0.01) else '！'
+            print(f"  {mark} 对账 pgsteal_direct 增量  : {d_steal}"
+                  f"（差 {diff}）")
+            if mark == '！':
+                print("    → 差得多。注意 pgsteal_direct 是**全局**计数器，"
+                      "而本工具只统计探针在线期间的事件；")
+                print("      另外 cgroup 内的回收不计入全局 pgsteal_direct"
+                      "（mm/vmscan.c:2213），若有容器在跑就会对不上。")
+        if d_scan is not None and sm['pages']:
+            if d_scan > 0:
+                print(f"  pgscan_direct 增量          : {d_scan}"
+                      f"  → 每回收 1 页要扫 {d_scan / sm['pages']:.1f} 页"
+                      "（这个比值越大说明 LRU 上越难找到可回收的页）")
+            else:
+                # 本工具说回收了页，内核说一页都没扫过 —— 两者不可能同时为真
+                print(f"  ！pgscan_direct 增量 = {d_scan}，但本工具报告回收了 "
+                      f"{sm['pages']} 页 —— 互相矛盾")
+                print("    → 要么基线取错了（探针挂载与读基线的先后），"
+                      "要么回收发生在 cgroup 内（mm/vmscan.c:2213："
+                      "cgroup 内回收不计全局计数器）")
+        # ALLOCSTALL：★ 必须四个桶全加。按 gfp_zone(gfp_mask) 分桶，
+        # 匿名页用 GFP_HIGHUSER_MOVABLE → 落在 allocstall_movable，
+        # 哪怕这台机器的 Movable zone 是空的。只加 normal+dma32 会漏掉绝大部分。
+        buckets = ['allocstall_dma', 'allocstall_dma32',
+                   'allocstall_normal', 'allocstall_movable']
+        parts = [self.vmstat_delta(self.vmstat_base, vm, k) for k in buckets]
+        if None not in parts:
+            total_as = sum(parts)
+            detail = '  '.join(f"{k.split('_')[1]}={v}"
+                               for k, v in zip(buckets, parts) if v)
+            print(f"  Σallocstall_*（四桶全加）   : {total_as}"
+                  f"   [{detail or '全为 0'}]")
+            # 等式：Σallocstall = begin 次数 + do_try_to_free_pages 内 retry 次数
+            #       （vmscan.c:3330 的 retry: 标签在 :3334 的计数之前）
+            #   所以 Σallocstall ≥ begin，差额就是 retry 次数。这**不是恒等式**。
+            if total_as >= s['begin']:
+                print(f"    → 减去 begin {s['begin']} 后剩 "
+                      f"{total_as - s['begin']}，这是 do_try_to_free_pages "
+                      "内部 goto retry 的次数（vmscan.c:3330 的 retry 标签"
+                      "在 :3334 计数之前）")
+            else:
+                print(f"    ！Σallocstall {total_as} < begin {s['begin']}，"
+                      "方向不对：这个不等式应当恒成立，需要查")
+
+        # ---------------- ★ PSI 交叉校验，连同它的两个偏差一起说清 ----------------
+        print()
+        print("★ 与 /proc/pressure/memory 对账（第三方来源，内核独立统计）：")
+        psi_now = self.read_psi()
+        if not psi_now or not self.psi_base:
+            print("  （读不到 PSI，可能内核没开 CONFIG_PSI）")
+        else:
+            d_some = psi_now.get('some', 0) - self.psi_base.get('some', 0)
+            d_full = psi_now.get('full', 0) - self.psi_base.get('full', 0)
+            print(f"  PSI some 增量 {d_some / 1e6:.3f} s / "
+                  f"full 增量 {d_full / 1e6:.3f} s")
+            print(f"  本工具外层总耗时 {outer_s:.3f} s")
+            if d_some > 0:
+                print(f"  比值（本工具 / PSI some）= {outer_s * 1e6 / d_some:.2f}")
+            print("  ★ 这**不是恒等式**，两个方向的偏差同时存在，别当成"
+                  "\"对上了就正确\"：")
+            print("    ① PSI 的口径更宽：psi_memstall_enter 在内核里有 5 处，"
+                  "本工具只覆盖 1 处")
+            print("       （page_alloc.c:4653 直接回收 ← 我们；"
+                  "page_alloc.c:4395 直接规整；")
+            print("        vmscan.c:3898 kswapd；vmscan.c:4514 node reclaim；"
+                  "compaction.c:2960 kcompactd）")
+            print("       → 压力大时 kswapd 那一处的贡献可能远超我们这一处，"
+                  "使 PSI 偏大")
+            print("    ② PSI some 是**墙钟**：N 个线程同时卡住只算一份时间，"
+                  "本工具是逐次求和")
+            print("       → 并发越高，本工具的总和相对 PSI 越偏大")
+            print("    所以这条校验能发现的是**数量级错误**"
+                  "（比如差 1000 倍 = 单位搞错了），不能证明数字精确。")
+            try:
+                with open('/proc/sys/vm/zone_reclaim_mode') as f:
+                    zrm = f.read().strip()
+                print(f"    （zone_reclaim_mode = {zrm}"
+                      f"{'，所以 node reclaim 那一处不贡献' if zrm == '0' else ''}）")
+            except OSError:
+                pass
+
+        # ---------------- 交叉校验：直方图有没有静默丢样本 ----------------
+        print()
+        hist_n = sum(sum(b.values()) for b in d['outer_lat'].values())
+        expect_n = s['outer_exit'] - s['outer_unpaired']
+        if hist_n == expect_n:
+            print(f"✓ 交叉校验通过：外层延迟直方图样本数 {hist_n} = "
+                  f"外层退出 {s['outer_exit']} − 未配对 {s['outer_unpaired']}")
+        else:
+            print(f"！交叉校验失败：直方图样本数 {hist_n} ≠ 期望 {expect_n}")
+            print("  → 有样本被静默丢掉了，最可能是直方图 map 满"
+                  "（BCC 的 increment() 失败时不报错）。延迟分布不可信。")
+
+        # ---------------- 直方图 ----------------
+        print()
+        print("进程被卡住的总时长（外层：含限流睡眠，这是用户感知到的卡顿）：")
+        for order in sorted(d['outer_lat']):
+            print(f"  order = {order}  （{(1 << order) * 4} KB）")
+            for line in self._fmt_hist(d['outer_lat'][order], 'order'):
+                print(line)
+        print()
+        print("纯扫描耗时（内层 begin→end，不含限流睡眠）：")
+        for order in sorted(d['inner_lat']):
+            print(f"  order = {order}  （{(1 << order) * 4} KB）")
+            for line in self._fmt_hist(d['inner_lat'][order], 'order'):
+                print(line)
+        print()
+        print(f"每次回收到的页数（log2 桶；另有 {s['zero_reclaim']} 次"
+              "回收到 0 页 —— 那是白卡一趟，全部延迟没换到一页）：")
+        for order in sorted(d['recl_hist']):
+            print(f"  order = {order}")
+            for line in self._fmt_hist(d['recl_hist'][order], 'order', unit='页'):
                 print(line)
 
     def run(self):
@@ -602,18 +1096,23 @@ if __name__ == "__main__":
           f"间隔 {args.interval}s"
           + (f"，运行 {args.duration}s" if args.duration else "，Ctrl-C 结束"))
 
-    if args.mode != 'compact':
-        # 其余 mode 的展示层是 v1 的 extfrag_user.py，这里不重复实现
+    # 本入口负责 v2 的两个文本展示；v1 的 frag/extfrag 仍走 extfrag_user.py 的 TUI
+    PRINTERS = {
+        'compact': 'print_compact',   # P0
+        'reclaim': 'print_reclaim',   # P1
+    }
+    if args.mode not in PRINTERS:
         raise SystemExit(
             f"mode={args.mode} 的展示请用 extfrag_user.py；"
-            "本入口目前只负责 compact 的文本输出")
+            f"本入口只负责 {'/'.join(PRINTERS)} 的文本输出")
+    show = getattr(ef, PRINTERS[args.mode])
 
     started = time.time()
     try:
         while True:
             time.sleep(args.interval)
             if not args.once:
-                ef.print_compact()
+                show()
                 print()
             if args.duration and (time.time() - started) >= args.duration:
                 break
@@ -622,4 +1121,4 @@ if __name__ == "__main__":
     finally:
         print("=" * 72)
         print("最终汇总")
-        ef.print_compact()
+        show()
