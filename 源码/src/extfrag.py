@@ -498,6 +498,10 @@ class ExtFrag:
         'throttle_slept',   # 9 疑似被限流睡过
         'ret_one',          # 10 返回值 = 1（有歧义，见 reclaiminfo.c 头部第四节）
         'no_direct_reclaim',  # 11 gfp 里没有 __GFP_DIRECT_RECLAIM（预期 0）
+        'stack_fail',       # 12 get_stackid 失败，这次的调用栈没记上
+        'hist_fail_outer',  # 13 ★ outer_lat 自增失败（BCC increment 静默失败）
+        'hist_fail_inner',  # 14 ★ inner_lat 自增失败
+        'hist_fail_recl',   # 15 ★ recl_hist 自增失败
     ]
 
     # sum_map 的下标，与 reclaiminfo.c 的 R_* 宏对应
@@ -788,8 +792,25 @@ class ExtFrag:
         for i, name in enumerate(self.RECL_SUM_NAMES):
             summ[name] = self.b["sum_map"][ctypes.c_int(i)].value
 
-        # 调用者栈：{解析后的栈文本: 次数}
-        callers = {}
+        # ★ 调用栈聚合，分成**两个**维度 —— 2026-08-18 观测轮改的，原因见下。
+        #
+        #   direct_callers：按**第 2 帧**（try_to_free_pages 的直接调用者）聚合。
+        #     这才是"到底有几个调用者"这个是非问题的答案。
+        #   alloc_sites  ：按前 6 帧的完整栈聚合，回答的是另一个问题 ——
+        #     "谁在申请内存导致的回收"，属于归因（P2 的雏形）。
+        #
+        #   原来这里只有一个维度、用整条 6 帧栈当 key 去数"有几个调用者"，
+        #   结果 9 条栈的第 2 帧其实**全是 __alloc_pages**，工具却报
+        #   "出现 9 条不同调用栈，前提可能被推翻"。分叉发生在第 3 帧往后，
+        #   那是分配点不是调用点 —— 把两个问题混成了一个。
+        #
+        # ★ 还有一个更严重的：原来写的是 `callers[文本] = v.value`，**赋值不是累加**。
+        #   多个 stackid 只要前 6 帧文本相同就互相覆盖，
+        #   实测 9 条栈加起来只有 60 次，而外层进入是 1299 次 —— 分布完全失真。
+        #   下面改成 += 之后，两个维度的总和都应当 = 外层进入 − stack_fail，
+        #   print_reclaim 里对这条等式做了显式核对。
+        direct_callers = {}
+        alloc_sites = {}
         try:
             stacks = self.b["caller_stacks"]
             for k, v in self.b["caller_count"].items():
@@ -801,7 +822,12 @@ class ExtFrag:
                               for a in stacks.walk(sid)]
                 except Exception:
                     frames = [f"（栈 {sid} 解析失败）"]
-                callers[' ← '.join(frames[:6])] = v.value
+                n = v.value
+                # 第 0 帧是 try_to_free_pages 自己，第 1 帧才是调用者
+                who = frames[1] if len(frames) > 1 else '（栈只有一帧）'
+                direct_callers[who] = direct_callers.get(who, 0) + n
+                site = ' ← '.join(frames[:6])
+                alloc_sites[site] = alloc_sites.get(site, 0) + n
         except KeyError:
             pass          # 没有这两个 map（不该发生，但不让它把整个输出搞崩）
 
@@ -811,7 +837,8 @@ class ExtFrag:
             'outer_lat': self._hist_to_dict(self.b["outer_lat"], 'order'),
             'inner_lat': self._hist_to_dict(self.b["inner_lat"], 'order'),
             'recl_hist': self._hist_to_dict(self.b["recl_hist"], 'order'),
-            'callers': callers,
+            'direct_callers': direct_callers,
+            'alloc_sites': alloc_sites,
         }
 
     def print_reclaim(self):
@@ -867,19 +894,38 @@ class ExtFrag:
         # "try_to_free_pages 只有一个调用者"这句话本地验证不了，
         # 所以直接把调用栈测出来。
         print()
-        print("★ 谁在调 try_to_free_pages（实测调用栈，不是靠读源码假设的）：")
-        if not d['callers']:
+        print("★ 谁在调 try_to_free_pages（实测调用栈的第 2 帧，"
+              "不是靠读源码假设的）：")
+        dc, sites = d['direct_callers'], d['alloc_sites']
+        if not dc:
             print("    （没有样本）")
         else:
-            for stack, n in sorted(d['callers'].items(), key=lambda x: -x[1]):
-                print(f"    {n:>7} 次  {stack}")
-            if len(d['callers']) == 1:
-                print("  ✓ 只有一条调用栈 → '唯一调用者'这个前提被实测证实，"
+            for who, n in sorted(dc.items(), key=lambda x: -x[1]):
+                print(f"    {n:>7} 次  {who}")
+            # 调用栈总数对账：应当等于 外层进入 − get_stackid 失败次数
+            got = sum(dc.values())
+            want = s['outer_enter'] - s['stack_fail']
+            if got == want:
+                print(f"  ✓ 栈样本总数 {got} = 外层进入 {s['outer_enter']} "
+                      f"− 取栈失败 {s['stack_fail']}")
+            else:
+                print(f"  ！栈样本总数 {got} ≠ 期望 {want}"
+                      f"（外层进入 {s['outer_enter']} − 取栈失败 "
+                      f"{s['stack_fail']}），下面的占比不可信")
+            if len(dc) == 1:
+                print("  ✓ 只有一个直接调用者 → '唯一调用者'这个前提被实测证实，"
                       "外层探针确实不需要来源过滤")
             else:
-                print(f"  ！出现 {len(d['callers'])} 条不同调用栈 —— 注意其中"
-                      "可能只是内联/栈深度差异，要看函数名是否真的不同。")
-                print("    若确实存在第二个调用者，'外层不需要过滤'的结论必须推翻。")
+                print(f"  ！出现 {len(dc)} 个不同的直接调用者 —— "
+                      "'外层不需要过滤'的结论必须推翻，外层-内层对账要重做。")
+
+            # ---- 另一个维度：谁在申请内存（归因，不是判定调用者的依据）----
+            print()
+            print("  谁的分配触发了回收（完整栈前 6 帧，这是归因不是调用者判定）：")
+            for site, n in sorted(sites.items(), key=lambda x: -x[1])[:10]:
+                print(f"    {n:>7} 次  {site}")
+            if len(sites) > 10:
+                print(f"    …… 另有 {len(sites) - 10} 条栈未显示")
 
         # ---------------- 限流：外层与内层的差额 ----------------
         # ★ vmscan.c:3569 那行 `if (throttle_direct_reclaim(...)) return 1;`
@@ -933,6 +979,21 @@ class ExtFrag:
             mark = '✓' if abs(diff) <= max(16, abs(d_steal) * 0.01) else '！'
             print(f"  {mark} 对账 pgsteal_direct 增量  : {d_steal}"
                   f"（差 {diff}）")
+            # ★ 这两个数**本来就不该完全相等**，而且差值的符号是固定的：
+            #   本工具读的是 end 埋点的 nr_reclaimed，也就是 sc->nr_reclaimed；
+            #   而 mm/vmscan.c:3082（shrink_node 里）有
+            #       sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+            #   —— slab shrinker 回收的页算进 nr_reclaimed，
+            #   但 pgsteal_direct 只在 :2229 的 shrink_inactive_list 里计 LRU 页，
+            #   **不含 slab**。所以正差额 = 这段时间 shrinker 释放的 slab 页
+            #   （dentry / inode 缓存之类）。负差额才是真异常。
+            if 0 < diff:
+                print(f"    → 正差额 {diff} 页（约 {diff * 4 / 1024:.1f} MB）"
+                      "= slab shrinker 回收的页：它算进 nr_reclaimed"
+                      "（vmscan.c:3082）但不算进 pgsteal_direct（只计 LRU 页）")
+            elif diff < 0:
+                print(f"    ！负差额 {diff}：本工具比内核**少**数了页，"
+                      "这个方向没有已知的合理解释，要查")
             if mark == '！':
                 print("    → 差得多。注意 pgsteal_direct 是**全局**计数器，"
                       "而本工具只统计探针在线期间的事件；")
@@ -1019,9 +1080,26 @@ class ExtFrag:
             print(f"✓ 交叉校验通过：外层延迟直方图样本数 {hist_n} = "
                   f"外层退出 {s['outer_exit']} − 未配对 {s['outer_unpaired']}")
         else:
-            print(f"！交叉校验失败：直方图样本数 {hist_n} ≠ 期望 {expect_n}")
-            print("  → 有样本被静默丢掉了，最可能是直方图 map 满"
-                  "（BCC 的 increment() 失败时不报错）。延迟分布不可信。")
+            lost = expect_n - hist_n
+            pct = (lost / expect_n * 100) if expect_n else 0.0
+            print(f"！交叉校验失败：直方图样本数 {hist_n} ≠ 期望 {expect_n}"
+                  f"，丢了 {lost} 个（{pct:.2f}%）")
+            # ★ 这里原来写的是"最可能是 map 满"。2026-08-18 的观测轮证伪了它：
+            #   三张直方图容量都是 1024，实际只用了 9 个 key。别再拿它当结论。
+            print(f"  自增失败计数：outer {s['hist_fail_outer']} / "
+                  f"inner {s['hist_fail_inner']} / recl {s['hist_fail_recl']}")
+            if s['hist_fail_outer'] == lost:
+                print("  → 丢的样本全部出在 lookup_or_try_init 失败这一步"
+                      "（不是 map 满：容量 1024，实际只用了几个 key）")
+            elif s['hist_fail_outer'] == 0:
+                print("  → 自增没失败过，说明丢在别处，回去查读 map 的时机")
+            else:
+                print("  → 自增失败只解释了一部分，剩下的另有来源")
+            if pct < 2.0:
+                print(f"  影响面：丢失 {pct:.2f}%，分布的形状和分位数基本不受影响，"
+                      "但样本总数不能直接当成事件数用")
+            else:
+                print("  影响面：丢失比例已经不小，延迟分布不可信")
 
         # ---------------- 直方图 ----------------
         print()
@@ -1043,6 +1121,23 @@ class ExtFrag:
             print(f"  order = {order}")
             for line in self._fmt_hist(d['recl_hist'][order], 'order', unit='页'):
                 print(line)
+        # ★ 32~63 那一格是有来历的，不是巧合：try_to_free_pages 的
+        #   scan_control 里 .nr_to_reclaim = SWAP_CLUSTER_MAX = 32
+        #   （mm/vmscan.c:3545），shrink_node 一旦攒够 32 页就返回。
+        #   所以"众数落在 32~63"本身就是一条对账 —— 直方图对上了内核常量。
+        recl_all = {}
+        for b in d['recl_hist'].values():
+            for slot, n in b.items():
+                recl_all[slot] = recl_all.get(slot, 0) + n
+        if recl_all:
+            top = max(recl_all, key=lambda x: recl_all[x])
+            tot = sum(recl_all.values())
+            lo = 0 if top == 0 else (1 << (top - 1))
+            print(f"  众数落在 {lo} ~ {(1 << top) - 1} 页"
+                  f"（{recl_all[top]}/{tot} = {recl_all[top] / tot * 100:.1f}%）"
+                  + ("  ← 正好压住 SWAP_CLUSTER_MAX = 32（vmscan.c:3545 的 "
+                     ".nr_to_reclaim），说明绝大多数调用是'扫够 32 页立刻返回'"
+                     if lo == 32 else ""))
 
     def run(self):
         """运行主循环

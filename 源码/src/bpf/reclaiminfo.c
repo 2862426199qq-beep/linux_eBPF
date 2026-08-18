@@ -175,7 +175,12 @@
 #define S_THROTTLE_SLEPT 9  // 疑似被限流睡过（外层 − 内层 > 阈值）
 #define S_RET_ONE       10  // 返回值恰好 = 1（有歧义，见头部第四节）
 #define S_NO_DIRECT_RECL 11 // gfp 里没有 __GFP_DIRECT_RECLAIM（预期为 0）
-#define STAT_SLOTS      12
+// ↓ 2026-08-18 正式观测轮之后补的四格，全是"把静默失败变成可见计数"
+#define S_STACK_FAIL     12 // get_stackid 返回负数，这一次的调用栈没记上
+#define S_HIST_FAIL_OUTER 13 // outer_lat 自增失败（见下面 HIST_INC 的说明）
+#define S_HIST_FAIL_INNER 14 // inner_lat 自增失败
+#define S_HIST_FAIL_RECL  15 // recl_hist 自增失败
+#define STAT_SLOTS      16
 
 // sum_map 的下标：需要总量（而不只是分布）的几个数
 #define R_PAGES       0  // 累计回收到的页数
@@ -268,6 +273,31 @@ static __always_inline void bump(int idx) {
   if (c) lock_xadd(c, 1);
 }
 
+// ★★ 直方图自增的"失败可见"版本，替换 BCC 自带的 hist.increment(k)。
+//
+//   BCC 的 increment() 展开成 lookup_or_try_init + lock_xadd，
+//   其中 init 那一步失败时它**静默返回、什么都不做**，没有返回值可查。
+//
+//   2026-08-18 的正式观测轮暴露了这个问题：三个直方图的样本数分别是
+//   1287 / 1291 / 1291，而对应的计数器都是 1299 —— 少了 12 / 8 / 8
+//   （约 0.9%）。当时输出里写的诊断是"最可能是 map 满"，**这个解释是错的**：
+//   三张表容量都是 1024，实际只用了 9 个 key。真实原因至今没定位
+//   （候选：预分配 hash map 的桶锁在同 CPU 重入时返回 -EBUSY、
+//     lookup_or_try_init 的 BPF_NOEXIST 竞争，两者都要另做实验才能分辨）。
+//
+//   定位不了，至少不能让它继续静默。这里把失败计到 stat_map 的一格里：
+//   下一轮观测就能直接看出"丢的样本是不是全出在这一步"，
+//   而不是只能看到一个对不上的总数、只能猜。
+//
+//   注意 lock_xadd 那一步不会失败 —— 指针非空就一定写得进去，
+//   所以这一格计的严格就是 init 失败次数。
+#define HIST_INC(_tbl, _key, _failslot) do {                 \
+    u64 _zero = 0;                                           \
+    u64 *_v = _tbl.lookup_or_try_init(&(_key), &_zero);      \
+    if (_v) lock_xadd(_v, 1);                                \
+    else    bump(_failslot);                                 \
+  } while (0)
+
 // ============================================================================
 // 外层入口：kprobe on try_to_free_pages
 //   签名（mm/vmscan.c:3540）：
@@ -300,6 +330,11 @@ int kprobe__try_to_free_pages(struct pt_regs *ctx, struct zonelist *zonelist,
   if (sid >= 0) {
     u64 zero = 0, *cnt = caller_count.lookup_or_try_init(&sid, &zero);
     if (cnt) lock_xadd(cnt, 1);
+  } else {
+    // ★ 取不到栈也要计数：不然用户态只能看到"调用栈次数之和 ≠ 进入次数"，
+    //   分不清是没取到栈、还是用户态聚合写错了。
+    //   （2026-08-18 那轮两个原因同时存在，就是因为这里没这一格才查了半天）
+    bump(S_STACK_FAIL);
   }
 
   // 自检：direct reclaim 的定义就是"允许阻塞去回收"，
@@ -378,7 +413,7 @@ TRACEPOINT_PROBE(vmscan, mm_vmscan_direct_reclaim_end) {
   struct lat_key_t k = {};
   k.order = in->order;
   k.slot  = bpf_log2l(delta_us);
-  inner_lat.increment(k);
+  HIST_INC(inner_lat, k, S_HIST_FAIL_INNER);
 
   // 回收到的页数分布。
   // ★ 为什么单独统计"回收到 0 页"：那是**完全白卡一趟** ——
@@ -391,7 +426,7 @@ TRACEPOINT_PROBE(vmscan, mm_vmscan_direct_reclaim_end) {
     struct lat_key_t rk = {};
     rk.order = in->order;
     rk.slot  = bpf_log2l(nr);
-    recl_hist.increment(rk);
+    HIST_INC(recl_hist, rk, S_HIST_FAIL_RECL);
   }
 
   idx = R_PAGES;
@@ -439,7 +474,7 @@ int kretprobe__try_to_free_pages(struct pt_regs *ctx) {
   struct lat_key_t k = {};
   k.order = o->order;
   k.slot  = bpf_log2l(outer_ns / 1000);
-  outer_lat.increment(k);
+  HIST_INC(outer_lat, k, S_HIST_FAIL_OUTER);
 
   idx = R_OUTER_NS;
   c = sum_map.lookup(&idx);
